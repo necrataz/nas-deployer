@@ -1,0 +1,7 @@
+# 运行时依赖
+paramiko>=3.4.0
+scp>=0.14.5
+ttkbootstrap>=1.10.1
+
+# 构建时依赖（CI 用）
+pyinstaller>=6.0
