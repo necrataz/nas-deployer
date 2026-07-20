@@ -337,8 +337,10 @@ class NASConnection:
         exit_code, output = self.run_command("df -BG / | tail -1", timeout=10)
         if exit_code != 0:
             return 0, 0, 0
-        # 解析: /dev/sda1  100G  50G  50G  50%  /
-        parts = output.split()
+        # 解析最后一行: /dev/sda1  100G  50G  50G  50%  /
+        # 必须取最后一行 (不要被 header line 污染)
+        last_line = output.strip().split("\n")[-1]
+        parts = last_line.split()
         if len(parts) >= 5:
             try:
                 total = int(parts[1].rstrip("G"))
