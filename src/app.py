@@ -29,10 +29,11 @@ from apps import APPS, PROFILES, get_visible_apps, get_apps_by_profile, total_me
 from compose_data import DOCKER_COMPOSE_YML
 from nas_profile import ProfileManager, NASProfile, KEYRING_AVAILABLE
 from progress_window import ProgressWindow
+from host_utils import clean_host, extract_port_from_host  # v1.3: host 字段清洗
 
 
 # 全局常量
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_NAME = "NAS 一键部署工具"
 
 # 旧版单 NAS 配置 (v1.0), 仅用于一次性迁移
@@ -550,26 +551,39 @@ class NASDeployerApp:
             self._on_nas_changed()
 
     def _migrate_legacy_config(self):
-        """v1.0 单 NAS 配置 → v1.1 多 NAS (一次性)"""
+        """v1.0 单 NAS 配置 → v1.1+ 多 NAS (一次性)
+
+        v1.3: 同步清洗 host 字段 (去 scheme/userinfo/path), 兼容 v1.0 污染数据
+        """
         if not LEGACY_CONFIG_FILE.exists():
             return
         if self.profile_mgr.profiles:
             return  # 已经有 profile, 不迁移
         try:
             data = json.loads(LEGACY_CONFIG_FILE.read_text(encoding="utf-8"))
-            # 生成默认 profile
+            # v1.3 清洗: 复用同样的清洗规则
+            host, port_from_host = extract_port_from_host(data.get("host", "192.168.3.88"))
+            # v1.0 config 有 port 字段, 优先用; 没有就用 host 里提取的
+            stored_port = data.get("port")
+            if stored_port:
+                port = int(stored_port)
+            elif port_from_host:
+                port = port_from_host
+            else:
+                port = 22
+
             new_id = ProfileManager.new_id()
             profile = NASProfile(
                 id=new_id,
                 name=data.get("name", "默认 NAS"),
-                host=data.get("host", "192.168.3.88"),
-                port=int(data.get("port", 22)),
+                host=host,
+                port=port,
                 user=data.get("user", "necrata"),
                 os_type=data.get("os_type", "fnos"),
             )
             self.profile_mgr.add(profile)
             self.profile_mgr.set_current(new_id)
-            self._log(f"🔄 已从 v1.0 配置迁移: {profile.name}")
+            self._log(f"🔄 已从 v1.0 配置迁移: {profile.name} (host={host}, port={port})")
             # 不删旧文件, 留着作为参考
         except Exception as e:
             print(f"[Migration] 失败: {e}")
@@ -909,18 +923,35 @@ class NASProfileDialog:
 
     def _on_save(self):
         name = self.name_var.get().strip()
-        host = self.host_var.get().strip()
+        host_raw = self.host_var.get().strip()
         port_str = self.port_var.get().strip()
         user = self.user_var.get().strip()
 
-        if not name or not host or not user:
+        if not name or not host_raw or not user:
             messagebox.showerror("错误", "名称、IP、用户名不能为空", parent=self.top)
             return
+
+        # v1.3 清洗 host + 提取可能粘在 host 里的端口
+        host, port_from_host = extract_port_from_host(host_raw)
+        if not host:
+            messagebox.showerror("错误", "host 清洗后为空, 请检查输入", parent=self.top)
+            return
+
         try:
             port = int(port_str)
         except ValueError:
             messagebox.showerror("错误", "端口必须是数字", parent=self.top)
             return
+
+        # 如果用户没改 port 字段 (默认 22) 且 host 里提取到端口, 提示用 host 里的
+        if port == 22 and port_from_host and port_from_host != 22:
+            if messagebox.askyesno(
+                "端口提示",
+                f"检测到 host 里带端口 {port_from_host}, 但 SSH 端口字段是默认 22.\n"
+                f"用 host 里的端口 {port_from_host} 吗?",
+                parent=self.top,
+            ):
+                port = port_from_host
 
         self.result = {
             "name": name,
