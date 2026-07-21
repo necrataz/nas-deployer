@@ -111,7 +111,7 @@ def test_connection_no_docker():
 
 
 def test_run_command_with_sudo():
-    """测试 sudo 命令执行"""
+    """测试 sudo 命令执行 (v1.6: 包进 sh -c 让 cd 等 builtin 能跑)"""
     from ssh_client import NASConnection
 
     conn = NASConnection()
@@ -130,15 +130,42 @@ def test_run_command_with_sudo():
 
     exit_code, output = conn.run_command("docker ps", sudo=True, timeout=10)
 
-    # 应该调用 sudo -S docker ps
+    # v1.6 fix: 应该包进 sh -c 让 cd 等 shell builtin 也能跑
     call_args = conn.client.exec_command.call_args
     actual_cmd = call_args[0][0]
-    assert actual_cmd == "sudo -S docker ps", f"Got: {actual_cmd}"
+    assert actual_cmd == "sudo -S sh -c 'docker ps'", f"Got: {actual_cmd}"
     # 应该写入密码
     mock_stdin.write.assert_called_with("testpwd\n")
     assert exit_code == 0
     assert "output" in output
-    print("✅ test_run_command_with_sudo")
+    print("✅ test_run_command_with_sudo (v1.6: sh -c wrapper)")
+
+
+def test_run_command_sudo_with_cd():
+    """v1.6 fix: sudo + cd 现在能正常跑了 (包进 sh -c)"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.user = "necrata"
+    conn.password = "testpwd"
+    conn.client = MagicMock()
+
+    stdout = MagicMock()
+    stdout.read.return_value = b"OK"
+    stdout.channel.recv_exit_status.return_value = 0
+    conn.client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
+
+    # 类似 install_apps 的命令: cd /tmp/nas_deploy && docker compose pull
+    cmd = "cd /tmp/nas_deploy && docker compose --profile movie pull"
+    exit_code, output = conn.run_command(cmd, sudo=True, timeout=10)
+
+    call_args = conn.client.exec_command.call_args
+    actual_cmd = call_args[0][0]
+    # 关键: 必须包进 sh -c 让 cd 能跑
+    assert "sh -c" in actual_cmd, f"v1.6 fix: should wrap in sh -c, got: {actual_cmd}"
+    assert "cd /tmp/nas_deploy" in actual_cmd
+    assert "--profile movie" in actual_cmd
+    print("✅ test_run_command_sudo_with_cd (v1.6 fix)")
 
 
 def test_run_command_without_sudo():
@@ -169,7 +196,7 @@ def test_run_command_without_sudo():
 
 
 def test_docker_cmd_uses_sudo():
-    """v1.5 fix: _docker_cmd helper 自动加 sudo (因为 docker socket 权限)"""
+    """v1.5 fix: _docker_cmd helper 自动加 sudo (v1.6 也包进 sh -c)"""
     from ssh_client import NASConnection
 
     conn = NASConnection()
@@ -186,10 +213,10 @@ def test_docker_cmd_uses_sudo():
     # _docker_cmd 内部调 run_command(sudo=True)
     exit_code, output = conn._docker_cmd("docker ps")
 
-    # 验证命令前面加了 'sudo -S '
+    # 验证命令: v1.6 包进 sh -c
     call_args = conn.client.exec_command.call_args
     actual_cmd = call_args[0][0]
-    assert actual_cmd == "sudo -S docker ps", f"Got: {actual_cmd}"
+    assert actual_cmd == "sudo -S sh -c 'docker ps'", f"v1.6 wrap, got: {actual_cmd}"
 
     # 验证 get_pty=True (sudo 需要 PTY)
     get_pty = call_args.kwargs.get("get_pty", call_args[1].get("get_pty") if len(call_args) > 1 else None)
@@ -197,7 +224,7 @@ def test_docker_cmd_uses_sudo():
 
     # 验证密码通过 stdin 发送了
     mock_stdin.write.assert_called_with("testpwd\n")
-    print("✅ test_docker_cmd_uses_sudo (v1.5)")
+    print("✅ test_docker_cmd_uses_sudo (v1.5 sudo + v1.6 sh -c)")
 
 
 def test_docker_cmd_skips_sudo_for_root():

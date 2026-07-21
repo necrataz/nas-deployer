@@ -122,12 +122,22 @@ class NASConnection:
         return self.run_command(cmd, sudo=True, timeout=timeout)
 
     def run_command(self, command: str, sudo: bool = False, timeout: int = 60) -> Tuple[int, str]:
-        """在远程执行命令, 可选 sudo"""
+        """在远程执行命令, 可选 sudo
+
+        v1.6 fix: sudo=True 时包进 sh -c '...' (让 cd 等 shell builtin 能运行)
+        之前 'sudo -S cd /path && cmd' 会报 'cd: command not found'
+        因为 sudo 不能直接执行 shell builtin
+        """
         if not self.client:
             return -1, "未连接"
 
         use_sudo = sudo and self.user != "root"
-        actual_cmd = f"sudo -S {command}" if use_sudo else command
+        if use_sudo:
+            # shell-escape 单引号: ' -> '"'"'
+            escaped = command.replace("'", "'\"'\"'")
+            actual_cmd = f"sudo -S sh -c '{escaped}'"
+        else:
+            actual_cmd = command
 
         try:
             stdin, stdout, stderr = self.client.exec_command(actual_cmd, timeout=timeout, get_pty=use_sudo)
@@ -157,6 +167,7 @@ class NASConnection:
         用于 v1.1+ 进度窗口的实时日志展示:
         - on_line(line: str) - 每收到一行输出调用一次
         - is_cancelled() -> bool - worker 线程轮询, 返回 True 时主动关闭 channel 中断命令
+        - sudo - 是否用 sudo (v1.6 fix: 自动包进 sh -c 让 cd 等 builtin 跑)
         - timeout - 单行最长等待时间 (秒), 超时也退出循环
 
         返回: 命令 exit_code (取消时返回 -1)
@@ -166,7 +177,12 @@ class NASConnection:
             return -1
 
         use_sudo = sudo and self.user != "root"
-        actual_cmd = f"sudo -S {command}" if use_sudo else command
+        if use_sudo:
+            # v1.6 fix: 同 run_command, sudo 时包进 sh -c
+            escaped = command.replace("'", "'\"'\"'")
+            actual_cmd = f"sudo -S sh -c '{escaped}'"
+        else:
+            actual_cmd = command
 
         try:
             import time
