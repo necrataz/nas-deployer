@@ -37,7 +37,9 @@ jobs:
         run: python tests/validate_compose.py
 
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --name NASDeployer --add-data "src/compose_data.py;." src/app.py
+        # v1.2 fix: --collect-data ttkbootstrap 把 assets/icons/bootstrap.ttf 等图标字体/PNG 打进 EXE
+        # 不加会报 FileNotFoundError: ...\ttkbootstrap\assets\icons\bootstrap.ttf
+        run: pyinstaller --onefile --windowed --name NASDeployer --collect-data ttkbootstrap --add-data "src/compose_data.py;." src/app.py
 
       - name: List build output
         run: dir dist

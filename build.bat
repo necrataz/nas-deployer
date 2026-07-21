@@ -43,11 +43,13 @@ if %errorlevel% neq 0 (
 
 REM 5. 语法检查
 echo.
-echo [INFO] 语法检查...
+echo [INFO] Syntax check...
 python -m py_compile src\app.py
 python -m py_compile src\ssh_client.py
 python -m py_compile src\apps.py
 python -m py_compile src\compose_data.py
+python -m py_compile src\nas_profile.py
+python -m py_compile src\progress_window.py
 
 REM 6. 清理之前的构建
 if exist build rmdir /s /q build
@@ -56,9 +58,12 @@ if exist NASDeployer.spec del NASDeployer.spec
 
 REM 7. PyInstaller 打包
 echo.
-echo [INFO] 开始打包 EXE (可能需要 1-3 分钟)...
+echo [INFO] Building EXE (may take 1-3 minutes)...
+REM v1.2 fix: --collect-data ttkbootstrap bundles assets/icons/bootstrap.ttf and other icon fonts
+REM Without it: FileNotFoundError: ...\ttkbootstrap\assets\icons\bootstrap.ttf at startup
 pyinstaller --onefile --windowed ^
     --name NASDeployer ^
+    --collect-data ttkbootstrap ^
     --add-data "src\compose_data.py;." ^
     src\app.py
 

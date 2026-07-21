@@ -32,7 +32,7 @@ from progress_window import ProgressWindow
 
 
 # 全局常量
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_NAME = "NAS 一键部署工具"
 
 # 旧版单 NAS 配置 (v1.0), 仅用于一次性迁移
