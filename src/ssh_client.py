@@ -1,5 +1,5 @@
 # ==============================================================================
-# NAS Deployer v1.8 - SSH + Docker 编排
+# NAS Deployer v1.9 - SSH + Docker 编排
 # v1.7 新增:
 #   1. run_command_streaming 新增 on_progress / progress_min / progress_max 参数
 #   2. 解析 docker compose v2 输出 "Pulling X/Y" / "Downloading X MB / Y MB"
@@ -7,12 +7,16 @@
 # v1.8 新增:
 #   1. pull_apps_streaming / install_apps_streaming 改 per-service pull, 失败 service 跳过
 #   2. install 阶段只 up 成功拉到的 service
+# v1.9 新增:
+#   1. _clean_ansi 剥 ANSI 控制字符 (docker compose spinner / 颜色码)
+#   2. run_command_streaming 加 spinner 去重 (相同内容行不重复推 UI)
 # ==============================================================================
 
 import paramiko
 from scp import SCPClient
 from typing import Tuple, Optional, List, Dict
 import io
+import re
 
 
 # v1.7: 字节单位换算 (用于解析 docker compose 下载进度 "5MB/20MB")
@@ -26,6 +30,30 @@ def _size_unit(unit: str) -> int:
     if u == "GB":
         return 1024 * 1024 * 1024
     return 1
+
+
+# v1.9: 剥 ANSI 控制字符 + 去掉 \r (docker compose spinner 输出单行反复刷)
+# 例: '[?25l[1A[1B[0G[33m⠋[0m libretv Pulling [34m0.1s [0m'
+#   → 'libretv Pulling'
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# 单独的 [?25h / [?25l 这种私有模式 (CSI ? + 字母)
+_ANSI_PRIVATE_RE = re.compile(r"\[\?[0-9]+[hl]")
+
+
+def _clean_ansi(s: str) -> str:
+    """剥 ANSI 控制序列 + 去 \r (光标回头覆盖字符)
+
+    v1.9 用户实测 v1.8 反馈: docker compose pull 的 spinner 行每 0.1s 输出一遍,
+    整个屏幕被 ANSI 控制字符 (光标定位 + 颜色码) 淹没, UI 日志区看不清
+    """
+    if not s:
+        return ""
+    s = _ANSI_ESCAPE_RE.sub("", s)
+    s = _ANSI_PRIVATE_RE.sub("", s)
+    # 去掉 \r 后可能剩余的 spinner 字符 (spinner 字符本身就是 unicode braille)
+    # 不强求清 spinner 字符, 让 _dedup_line 去重处理
+    s = s.replace("\r", "")
+    return s.strip()
 
 
 class NASConnection:
@@ -213,7 +241,6 @@ class NASConnection:
             actual_cmd = command
 
         try:
-            import re
             import time
             stdin, stdout, stderr = self.client.exec_command(
                 actual_cmd, timeout=timeout, get_pty=use_sudo
@@ -232,6 +259,10 @@ class NASConnection:
             pull_total = 0      # docker compose pull 输出 "Pulling fs layer" 总数
             pull_done = 0       # 已完成的 layer 数
             last_progress_pct = -1.0  # 上次推过的 percent, 避免重复推
+            # v1.9: spinner 行去重 (docker compose 每 0.1s 输出一遍同样的 spinner,
+            # 不去重日志区瞬间被刷爆). 相同内容 (剥 ANSI 后) 不重复 on_line
+            last_line = None
+            last_line_ts = 0.0
 
             # docker compose 输出示例:
             #   "Pulling 3 / 4"                       (compose v2)
@@ -268,7 +299,25 @@ class NASConnection:
                     on_line("[INFO] 命令已被用户取消")
                     cancelled = True
                     break
-                stripped = line.rstrip("\n")
+
+                # v1.9: 剥 ANSI 控制字符 (spinner / 光标定位 / 颜色码)
+                # docker compose 用 PTY 输出 ANSI 控制序列, 不剥掉日志区全是乱码
+                stripped = _clean_ansi(line.rstrip("\n"))
+
+                # v1.9: spinner 去重 — docker compose 每 0.1s 输出同样内容
+                # (除 spinner 字符外), 不去重一秒 10 行刷屏.
+                # 规则: 剥 ANSI 后内容相同 → 跳过 on_line (但仍解析进度)
+                now = time.time()
+                if stripped == last_line and (now - last_line_ts) < 2.0:
+                    # 2 秒内相同行跳过 (放宽到 2s 给 spinner 留余地)
+                    continue
+                last_line = stripped
+                last_line_ts = now
+
+                # 跳过空行 (避免噪音)
+                if not stripped:
+                    continue
+
                 on_line(stripped)
 
                 # v1.7: 解析 docker compose v2 的 "Pulling X / Y" 进度

@@ -759,6 +759,124 @@ def test_install_apps_streaming_all_fail():
     print(f"✅ test_install_apps_streaming_all_fail (v1.8)")
 
 
+# v1.9 新增: ANSI 剥除 + spinner 去重
+def test_clean_ansi():
+    """v1.9: 剥 ANSI 控制字符 + spinner 字符 + 私有模式 ([?25h / [?25l)"""
+    from ssh_client import _clean_ansi
+    # 颜色码
+    assert "\x1b[33m" not in _clean_ansi("\x1b[33mhello\x1b[0m")
+    # 光标定位
+    assert _clean_ansi("\x1b[1A\x1b[1B\x1b[0Gfoo") == "foo"
+    # 私有模式 (docker compose 用)
+    assert _clean_ansi("\x1b[?25l[+] Pulling 0/1\x1b[?25h") == "[+] Pulling 0/1"
+    # \r 去掉
+    assert "\r" not in _clean_ansi("foo\rbar")
+    # 混合
+    s = "\x1b[?25l\x1b[1A\x1b[0G\x1b[33m⠋\x1b[0m libretv Pulling \x1b[34m0.1s\x1b[0m"
+    cleaned = _clean_ansi(s)
+    assert "\x1b" not in cleaned
+    assert "libretv Pulling" in cleaned
+    # 空字符串
+    assert _clean_ansi("") == ""
+    print("✅ test_clean_ansi (v1.9)")
+
+
+def test_run_command_streaming_dedup_spinner():
+    """v1.9: docker compose spinner 反复刷同样内容, run_command_streaming 不重复推 UI"""
+    from ssh_client import NASConnection
+    import time as _t
+
+    conn = NASConnection()
+    conn.client = MagicMock()
+    conn.user = "necrata"
+    conn.password = "fake"
+
+    mock_stdin = MagicMock()
+    mock_stdout = MagicMock()
+    mock_stderr = MagicMock()
+    mock_stdout.channel.recv_exit_status.return_value = 0
+
+    # 模拟 docker compose 反复输出同样 spinner 10 次 (内容相同, 时间隔 0.05s)
+    # 最后输出一行新内容 "Pull complete"
+    base_line = "\x1b[?25l\x1b[33m⠋\x1b[0m libretv Pulling \x1b[34m0.1s\x1b[0m"
+    lines = [base_line] * 10 + ["\x1b[?25h\x1b[32mPull complete\x1b[0m\n", ""]
+    line_iter = iter(lines)
+    mock_stdout.readline.side_effect = lambda: next(line_iter, "")
+    mock_stderr.readline.return_value = ""
+    conn.client.exec_command.return_value = (mock_stdin, mock_stdout, mock_stderr)
+
+    lines_received = []
+    def on_line(line):
+        lines_received.append(line)
+
+    # mock time.time 让 spinner 时间间隔都 < 2s, 触发去重
+    base_ts = [1000.0]
+    real_time = _t.time
+    def fake_time():
+        base_ts[0] += 0.05
+        return base_ts[0]
+    _t.time = fake_time
+    try:
+        conn.run_command_streaming(
+            "docker compose pull libretv",
+            on_line=on_line,
+            sudo=False,
+            timeout=30,
+        )
+    finally:
+        _t.time = real_time
+
+    # 期望: spinner 内容相同 9 次被去重, 只第一次到 on_line, 最后 "Pull complete" 也到
+    # 所以 lines_received 应该 <= 2 条
+    assert len(lines_received) <= 2, f"expected dedup, got {len(lines_received)} lines: {lines_received}"
+    assert any("libretv Pulling" in l for l in lines_received), f"missing libretv line: {lines_received}"
+    assert any("Pull complete" in l for l in lines_received), f"missing Pull complete: {lines_received}"
+    print(f"✅ test_run_command_streaming_dedup_spinner (v1.9) — {len(lines_received)} lines after dedup (was 10+)")
+
+
+def test_run_command_streaming_ansi_escape():
+    """v1.9: readline 拿到的原始 ANSI 行被剥干净后再传给 on_line"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.client = MagicMock()
+    conn.user = "necrata"
+    conn.password = "fake"
+
+    mock_stdin = MagicMock()
+    mock_stdout = MagicMock()
+    mock_stderr = MagicMock()
+    mock_stdout.channel.recv_exit_status.return_value = 0
+
+    lines = [
+        "\x1b[33m⠋\x1b[0m qbittorrent Pulling \x1b[34m0.5s\x1b[0m\n",
+        "\x1b[32mPull complete\x1b[0m\n",
+        "",
+    ]
+    line_iter = iter(lines)
+    mock_stdout.readline.side_effect = lambda: next(line_iter, "")
+    mock_stderr.readline.return_value = ""
+    conn.client.exec_command.return_value = (mock_stdin, mock_stdout, mock_stderr)
+
+    lines_received = []
+    def on_line(line):
+        lines_received.append(line)
+
+    conn.run_command_streaming(
+        "docker compose pull qbittorrent",
+        on_line=on_line,
+        sudo=False,
+        timeout=30,
+    )
+
+    # 所有 ANSI 字符都应被剥掉
+    for l in lines_received:
+        assert "\x1b" not in l, f"ANSI not stripped: {l!r}"
+    assert any("qbittorrent Pulling" in l for l in lines_received)
+    assert any("Pull complete" in l for l in lines_received)
+    print(f"✅ test_run_command_streaming_ansi_escape (v1.9)")
+
+
 if __name__ == "__main__":
     tests = [
         test_connection_success,
@@ -783,6 +901,9 @@ if __name__ == "__main__":
         test_install_apps_streaming_partial_failure,  # v1.8
         test_pull_apps_streaming_partial_failure,  # v1.8
         test_install_apps_streaming_all_fail,  # v1.8
+        test_clean_ansi,                   # v1.9
+        test_run_command_streaming_dedup_spinner,  # v1.9
+        test_run_command_streaming_ansi_escape,  # v1.9
     ]
 
     passed = 0
