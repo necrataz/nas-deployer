@@ -168,11 +168,67 @@ def test_run_command_without_sudo():
     print("✅ test_run_command_without_sudo")
 
 
-def test_install_apps_profile_mapping():
-    """测试安装时正确解析 profile + v1.4 SFTP fix"""
+def test_docker_cmd_uses_sudo():
+    """v1.5 fix: _docker_cmd helper 自动加 sudo (因为 docker socket 权限)"""
     from ssh_client import NASConnection
 
     conn = NASConnection()
+    conn.user = "necrata"
+    conn.password = "testpwd"
+    conn.client = MagicMock()
+
+    stdout = MagicMock()
+    stdout.read.return_value = b"OK"
+    stdout.channel.recv_exit_status.return_value = 0
+    mock_stdin = MagicMock()
+    conn.client.exec_command.return_value = (mock_stdin, stdout, MagicMock())
+
+    # _docker_cmd 内部调 run_command(sudo=True)
+    exit_code, output = conn._docker_cmd("docker ps")
+
+    # 验证命令前面加了 'sudo -S '
+    call_args = conn.client.exec_command.call_args
+    actual_cmd = call_args[0][0]
+    assert actual_cmd == "sudo -S docker ps", f"Got: {actual_cmd}"
+
+    # 验证 get_pty=True (sudo 需要 PTY)
+    get_pty = call_args.kwargs.get("get_pty", call_args[1].get("get_pty") if len(call_args) > 1 else None)
+    assert get_pty is True, f"sudo requires get_pty=True, got: {get_pty}"
+
+    # 验证密码通过 stdin 发送了
+    mock_stdin.write.assert_called_with("testpwd\n")
+    print("✅ test_docker_cmd_uses_sudo (v1.5)")
+
+
+def test_docker_cmd_skips_sudo_for_root():
+    """_docker_cmd 不会给 root 加 sudo (不需要)"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.user = "root"  # root 用户
+    conn.password = "x"
+    conn.client = MagicMock()
+
+    stdout = MagicMock()
+    stdout.read.return_value = b"OK"
+    stdout.channel.recv_exit_status.return_value = 0
+    conn.client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
+
+    conn._docker_cmd("docker ps")
+
+    call_args = conn.client.exec_command.call_args
+    actual_cmd = call_args[0][0]
+    assert actual_cmd == "docker ps", f"root should skip sudo, got: {actual_cmd}"
+    print("✅ test_docker_cmd_skips_sudo_for_root")
+
+
+def test_install_apps_profile_mapping():
+    """测试安装时正确解析 profile + v1.4 SFTP fix + v1.5 sudo"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.user = "necrata"
+    conn.password = "testpwd"
     conn.client = MagicMock()
     conn.transport = MagicMock()
     conn.is_connected = MagicMock(return_value=True)
@@ -184,13 +240,11 @@ def test_install_apps_profile_mapping():
         mock_file = MagicMock()
         mock_sftp.open.return_value.__enter__.return_value = mock_file
 
-        # 模拟 docker compose 命令成功
+        # 模拟所有 docker 命令成功 (包括 mkdir)
         stdout = MagicMock()
-        stdout.read.return_value = b"Container moviepilot Started"
-        stderr = MagicMock()
-        stderr.read.return_value = b""
+        stdout.read.return_value = b""
         stdout.channel.recv_exit_status.return_value = 0
-        conn.client.exec_command.return_value = (MagicMock(), stdout, stderr)
+        conn.client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
 
         selected = ["moviepilot", "qbittorrent", "libretv", "dashy"]  # movie + nav profile
         ok, msg = conn.install_apps(selected, "dummy compose")
@@ -198,20 +252,29 @@ def test_install_apps_profile_mapping():
         assert ok is True, f"Got: {msg}"
         # 验证 compose 上传走的是 from_transport
         mock_from_transport.assert_called()
+
+        # v1.5 fix: 验证 docker compose pull/up 命令都加 sudo
+        all_cmds = [str(call.args[0]) for call in conn.client.exec_command.call_args_list]
+        docker_cmds = [c for c in all_cmds if "docker compose" in c]
+        assert len(docker_cmds) >= 2, f"Expected docker compose commands, got: {all_cmds}"
+        for cmd in docker_cmds:
+            assert "sudo -S " in cmd, \
+                f"v1.5 fix: docker compose command should use sudo, got: {cmd}"
+
         # 验证执行的命令包含正确 profile
-        calls = conn.client.exec_command.call_args_list
-        cmd_str = " ".join(str(c) for c in calls)
+        cmd_str = " ".join(all_cmds)
         assert "--profile movie" in cmd_str, f"Missing movie profile in: {cmd_str}"
         assert "--profile nav" in cmd_str, f"Missing nav profile in: {cmd_str}"
-        print("✅ test_install_apps_profile_mapping (v1.4 fix)")
+        print("✅ test_install_apps_profile_mapping (v1.4 SFTP + v1.5 sudo)")
 
 
 def test_install_apps_no_selection():
-    """测试没选应用时的处理 + v1.4 SFTP fix"""
+    """测试没选应用时的处理 + v1.4 SFTP fix + v1.5 sudo"""
     from ssh_client import NASConnection
 
     conn = NASConnection()
     conn.user = "necrata"
+    conn.password = "testpwd"  # v1.5: sudo 需要密码
     conn.client = MagicMock()
     conn.transport = MagicMock()
     conn.is_connected = MagicMock(return_value=True)
@@ -235,11 +298,12 @@ def test_install_apps_no_selection():
 
 
 def test_container_parsing():
-    """测试 docker ps 输出解析"""
+    """测试 docker ps 输出解析 (v1.5: docker 命令走 sudo, 需要 conn.password)"""
     from ssh_client import NASConnection
 
     conn = NASConnection()
     conn.user = "necrata"
+    conn.password = "testpwd"  # v1.5: sudo 需要密码
     conn.client = MagicMock()
 
     stdout = MagicMock()
@@ -409,6 +473,8 @@ if __name__ == "__main__":
         test_connection_no_docker,
         test_run_command_with_sudo,
         test_run_command_without_sudo,
+        test_docker_cmd_uses_sudo,
+        test_docker_cmd_skips_sudo_for_root,
         test_install_apps_profile_mapping,
         test_install_apps_no_selection,
         test_container_parsing,

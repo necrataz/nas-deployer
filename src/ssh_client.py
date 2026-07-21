@@ -108,6 +108,19 @@ class NASConnection:
         return True, f"✅ 一切就绪\nOS: {uname_out}\nDocker: {docker_out}\nCompose: {compose_out}"
 
     # -------------------- 命令执行 --------------------
+    def _docker_cmd(self, cmd: str, timeout: int = 60) -> Tuple[int, str]:
+        """跑 docker 命令, 自动 sudo (因为 docker socket 普通用户访问不了)
+
+        v1.5 fix: 之前所有 docker 命令都没 sudo, fnOS 上 necrata 账号无 docker 组权限
+        → 'dial unix /var/run/docker.sock: connect: permission denied'
+        集中走这个 helper, 所有 docker 操作都自动加 sudo=True
+
+        例外:
+        - test_environment() 里的 'docker --version' / 'docker compose version' 不走这里
+          (版本查询普通用户能跑, 加上 sudo 反而可能要求 TTY password)
+        """
+        return self.run_command(cmd, sudo=True, timeout=timeout)
+
     def run_command(self, command: str, sudo: bool = False, timeout: int = 60) -> Tuple[int, str]:
         """在远程执行命令, 可选 sudo"""
         if not self.client:
@@ -242,8 +255,8 @@ class NASConnection:
 
     # -------------------- Docker 操作 --------------------
     def get_installed_containers(self) -> List[Dict[str, str]]:
-        """列出正在运行的容器"""
-        exit_code, output = self.run_command(
+        """列出正在运行的容器 (v1.5: 走 sudo 因为 docker socket 权限)"""
+        exit_code, output = self._docker_cmd(
             'docker ps --format "{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}"'
         )
         containers = []
@@ -263,8 +276,8 @@ class NASConnection:
         return containers
 
     def get_all_apps_status(self) -> List[Dict[str, str]]:
-        """列出所有容器（含停止的）, 用于状态展示"""
-        exit_code, output = self.run_command(
+        """列出所有容器（含停止的）, 用于状态展示 (v1.5: 走 sudo)"""
+        exit_code, output = self._docker_cmd(
             'docker ps -a --format "{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}"'
         )
         containers = []
@@ -331,11 +344,11 @@ class NASConnection:
 
         profiles_str = " ".join(f"--profile {p}" for p in profiles_to_pull)
 
-        # 3. 拉取镜像
+        # 3. 拉取镜像 (v1.5: sudo 因为 docker socket 权限)
         on_progress(20, f"拉取镜像 ({', '.join(sorted(profiles_to_pull))})...")
         pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
         exit_code = self.run_command_streaming(
-            pull_cmd, on_line=on_line, is_cancelled=is_cancelled, timeout=1800
+            pull_cmd, on_line=on_line, is_cancelled=is_cancelled, sudo=True, timeout=1800
         )
         if is_cancelled and is_cancelled():
             return False, "用户取消"
@@ -397,22 +410,22 @@ class NASConnection:
 
         profiles_str = " ".join(f"--profile {p}" for p in profiles_to_enable)
 
-        # 4. 拉取镜像 (10%-60% 进度)
+        # 4. 拉取镜像 (10%-60% 进度) (v1.5: sudo)
         on_progress(15, f"拉取镜像 ({', '.join(sorted(profiles_to_enable))})...")
         pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
         exit_code = self.run_command_streaming(
-            pull_cmd, on_line=on_line, is_cancelled=is_cancelled, timeout=1800
+            pull_cmd, on_line=on_line, is_cancelled=is_cancelled, sudo=True, timeout=1800
         )
         if is_cancelled and is_cancelled():
             return False, "用户取消"
         if exit_code != 0:
             return False, f"拉取镜像失败 (exit={exit_code})"
 
-        # 5. 启动容器 (60%-95%)
+        # 5. 启动容器 (60%-95%) (v1.5: sudo)
         on_progress(65, "启动容器...")
         up_cmd = f"cd {remote_dir} && docker compose {profiles_str} up -d"
         exit_code = self.run_command_streaming(
-            up_cmd, on_line=on_line, is_cancelled=is_cancelled, timeout=600
+            up_cmd, on_line=on_line, is_cancelled=is_cancelled, sudo=True, timeout=600
         )
         if is_cancelled and is_cancelled():
             return False, "用户取消"
@@ -458,16 +471,16 @@ class NASConnection:
         if not profiles_to_enable:
             return False, "没有需要启用的 profile"
 
-        # 4. 拉取镜像 (后台执行, 加快启动)
+        # 4. 拉取镜像 (后台执行, 加快启动) (v1.5: sudo)
         profiles_str = " ".join(f"--profile {p}" for p in profiles_to_enable)
         pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
-        exit_code, output = self.run_command(pull_cmd, timeout=900)
+        exit_code, output = self._docker_cmd(pull_cmd, timeout=900)
         if exit_code != 0:
             return False, f"拉取镜像失败: {output}"
 
-        # 5. 启动容器
+        # 5. 启动容器 (v1.5: sudo)
         up_cmd = f"cd {remote_dir} && docker compose {profiles_str} up -d"
-        exit_code, output = self.run_command(up_cmd, timeout=600)
+        exit_code, output = self._docker_cmd(up_cmd, timeout=600)
         if exit_code != 0:
             return False, f"启动失败: {output}"
 
@@ -498,7 +511,7 @@ class NASConnection:
 
         profiles_str = " ".join(f"--profile {p}" for p in profiles_to_stop)
         stop_cmd = f"cd {remote_dir} && docker compose {profiles_str} stop"
-        exit_code, output = self.run_command(stop_cmd, timeout=300)
+        exit_code, output = self._docker_cmd(stop_cmd, timeout=300)
         return exit_code == 0, output
 
     def restart_apps(self, selected_apps: List[str], compose_content: str) -> Tuple[bool, str]:
@@ -523,7 +536,7 @@ class NASConnection:
 
         profiles_str = " ".join(f"--profile {p}" for p in profiles_to_restart)
         restart_cmd = f"cd {remote_dir} && docker compose {profiles_str} restart"
-        exit_code, output = self.run_command(restart_cmd, timeout=300)
+        exit_code, output = self._docker_cmd(restart_cmd, timeout=300)
         return exit_code == 0, output
 
     def pull_images(self, selected_apps: List[str], compose_content: str) -> Tuple[bool, str]:
@@ -548,12 +561,12 @@ class NASConnection:
 
         profiles_str = " ".join(f"--profile {p}" for p in profiles_to_pull)
         pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
-        exit_code, output = self.run_command(pull_cmd, timeout=1800)
+        exit_code, output = self._docker_cmd(pull_cmd, timeout=1800)
         return exit_code == 0, output
 
     def get_container_logs(self, container_name: str, tail: int = 100) -> str:
-        """获取容器最近 N 行日志"""
-        exit_code, output = self.run_command(f"docker logs --tail {tail} {container_name}", timeout=30)
+        """获取容器最近 N 行日志 (v1.5: 走 sudo)"""
+        exit_code, output = self._docker_cmd(f"docker logs --tail {tail} {container_name}", timeout=30)
         return output if exit_code == 0 else f"获取日志失败: {output}"
 
     def check_disk_space(self) -> Tuple[int, int, int]:
