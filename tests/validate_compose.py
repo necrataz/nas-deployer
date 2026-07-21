@@ -5,6 +5,12 @@ CI / pre-build 都跑这个, 不依赖外部服务
 """
 import sys
 import os
+import io
+
+# Windows PowerShell 默认 cp1252 编码, 中文/emoji 会炸 → 强制 UTF-8
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 # 让脚本能从 src/ 目录导入
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
