@@ -37,11 +37,7 @@ jobs:
         run: python tests/validate_compose.py
 
       - name: Build EXE
-        run: |
-          pyinstaller --onefile --windowed ^
-            --name NASDeployer ^
-            --add-data "src/compose_data.py;." ^
-            src/app.py
+        run: pyinstaller --onefile --windowed --name NASDeployer --add-data "src/compose_data.py;." src/app.py
 
       - name: List build output
         run: dir dist
