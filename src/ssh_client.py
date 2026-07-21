@@ -1,9 +1,12 @@
 # ==============================================================================
-# NAS Deployer v1.7 - SSH + Docker 编排
+# NAS Deployer v1.8 - SSH + Docker 编排
 # v1.7 新增:
 #   1. run_command_streaming 新增 on_progress / progress_min / progress_max 参数
 #   2. 解析 docker compose v2 输出 "Pulling X/Y" / "Downloading X MB / Y MB"
 #   3. _size_unit helper 处理字节单位换算
+# v1.8 新增:
+#   1. pull_apps_streaming / install_apps_streaming 改 per-service pull, 失败 service 跳过
+#   2. install 阶段只 up 成功拉到的 service
 # ==============================================================================
 
 import paramiko
@@ -419,6 +422,11 @@ class NASConnection:
         用于 v1.1+ 进度窗口的实时日志展示
         (v1.4 拆自 install_apps_streaming, 之前 _pull_thread 用 echo 写假 compose 被 docker 当 YAML 解析崩)
 
+        v1.8 fix: per-service 单独 pull, 失败的服务跳过不影响其他服务
+        之前用 `docker compose --profile X pull` 一次性拉, 任一服务镜像拉不到 (网络慢/源挂)
+        → 整批 abort, 后面已经 Pulled 的服务也不能用. 现在按 selected_apps 逐个 service 拉,
+        失败的进 skipped 列表, 仍返回 True 让用户继续后续操作.
+
         on_line(line: str) - 每行输出
         on_progress(percent: float, stage: str) - 阶段进度
         is_cancelled() -> bool - worker 线程轮询
@@ -427,7 +435,7 @@ class NASConnection:
             return False, "未连接"
 
         # 1. 创建临时目录 + 上传真实 compose (v1.4 fix: 不能用 placeholder)
-        on_progress(10, "上传 docker-compose.yml...")
+        on_progress(5, "准备远程目录...")
         remote_dir = "/tmp/nas_deploy"
         remote_compose = f"{remote_dir}/docker-compose.yml"
 
@@ -439,41 +447,49 @@ class NASConnection:
         if not ok:
             return False, f"上传 compose 失败: {msg}"
 
-        # 2. 解析要拉的 profile
+        # 2. 解析要拉取的 service (每个 app 一个 service)
         from apps import APPS
-        profiles_to_pull = set()
-        if profile_overrides:
-            profiles_to_pull.update(profile_overrides)
-        else:
-            for app_key in selected_apps:
-                if app_key in APPS:
-                    profiles_to_pull.add(APPS[app_key]["profile"])
+        services_to_pull = list(selected_apps)  # apps dict 的 key 就是 service 名
+        if not services_to_pull:
+            return False, "没有需要拉取的应用"
 
-        if not profiles_to_pull:
-            return False, "没有需要拉取的 profile"
+        # 3. 逐个 service 拉取 (v1.8)
+        skipped = []   # 拉失败/取消的
+        succeeded = []  # 拉成功的
+        total = len(services_to_pull)
+        for idx, svc in enumerate(services_to_pull):
+            if is_cancelled and is_cancelled():
+                return False, "用户取消"
 
-        profiles_str = " ".join(f"--profile {p}" for p in profiles_to_pull)
+            on_progress(5 + (idx / total) * 90, f"拉取 {svc} ({idx+1}/{total})...")
+            on_line(f"\n=== 拉取 {svc} ({idx+1}/{total}) ===")
 
-        # 3. 拉取镜像 (v1.5: sudo 因为 docker socket 权限, v1.7: 进度细化 20→80%)
-        on_progress(20, f"拉取镜像 ({', '.join(sorted(profiles_to_pull))})...")
-        pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
-        exit_code = self.run_command_streaming(
-            pull_cmd,
-            on_line=on_line,
-            is_cancelled=is_cancelled,
-            sudo=True,
-            timeout=1800,
-            on_progress=on_progress,
-            progress_min=20.0,
-            progress_max=80.0,
-        )
-        if is_cancelled and is_cancelled():
-            return False, "用户取消"
-        if exit_code != 0:
-            return False, f"拉取镜像失败 (exit={exit_code})"
+            pull_cmd = f"cd {remote_dir} && docker compose pull {svc}"
+            exit_code = self.run_command_streaming(
+                pull_cmd,
+                on_line=on_line,
+                is_cancelled=is_cancelled,
+                sudo=True,
+                timeout=600,
+            )
+            if is_cancelled and is_cancelled():
+                return False, "用户取消"
+            if exit_code != 0:
+                on_line(f"[WARN] {svc} 拉取失败, 跳过")
+                skipped.append(svc)
+            else:
+                succeeded.append(svc)
 
         on_progress(100, "完成")
-        return True, f"已拉取 profiles: {', '.join(sorted(profiles_to_pull))}"
+        # 即便有 skipped 也返回 True (用户能继续操作已拉到的服务)
+        # 但 msg 要明确告知哪些跳过
+        if skipped:
+            msg = (
+                f"已拉取 {len(succeeded)} 个, 跳过 {len(skipped)} 个: "
+                f"{', '.join(skipped)}"
+            )
+            return True, msg
+        return True, f"已拉取 {len(succeeded)} 个: {', '.join(succeeded)}"
 
     def install_apps_streaming(
         self,
@@ -488,8 +504,8 @@ class NASConnection:
 
         流程:
         1. 上传 docker-compose.yml (快)
-        2. docker compose pull (慢, 实时日志)
-        3. docker compose up -d (慢, 实时日志)
+        2. docker compose pull (慢, 实时日志, 失败 service 跳过)  ← v1.8 改 per-service
+        3. docker compose up -d 已拉到镜像的 service (慢, 实时日志)
 
         on_line(line: str) - 每行输出
         on_progress(percent: float, stage: str) - 阶段进度 (0-100)
@@ -512,42 +528,45 @@ class NASConnection:
         if not ok:
             return False, f"上传 compose 失败: {msg}"
 
-        # 3. 解析需要启用的 profile
+        # 3. 解析需要启用的 profile (v1.8: 改成逐 service)
         from apps import APPS
-        profiles_to_enable = set()
-        if profile_overrides:
-            profiles_to_enable.update(profile_overrides)
-        else:
-            for app_key in selected_apps:
-                if app_key in APPS:
-                    profiles_to_enable.add(APPS[app_key]["profile"])
+        services_to_install = list(selected_apps)
+        if not services_to_install:
+            return False, "没有需要安装的应用"
 
-        if not profiles_to_enable:
-            return False, "没有需要启用的 profile"
+        # 4. 拉取镜像 (10%-60%) (v1.8 per-service, 失败跳过)
+        on_progress(15, f"拉取 {len(services_to_install)} 个服务...")
+        skipped = []
+        succeeded_pull = []
+        total = len(services_to_install)
+        for idx, svc in enumerate(services_to_install):
+            if is_cancelled and is_cancelled():
+                return False, "用户取消"
+            on_line(f"\n=== 拉取 {svc} ({idx+1}/{total}) ===")
+            pull_cmd = f"cd {remote_dir} && docker compose pull {svc}"
+            exit_code = self.run_command_streaming(
+                pull_cmd,
+                on_line=on_line,
+                is_cancelled=is_cancelled,
+                sudo=True,
+                timeout=600,
+            )
+            if is_cancelled and is_cancelled():
+                return False, "用户取消"
+            if exit_code != 0:
+                on_line(f"[WARN] {svc} 拉取失败, 跳过")
+                skipped.append(svc)
+            else:
+                succeeded_pull.append(svc)
 
-        profiles_str = " ".join(f"--profile {p}" for p in profiles_to_enable)
+        if not succeeded_pull:
+            on_progress(100, "全部镜像拉取失败")
+            return False, f"全部 {len(skipped)} 个服务镜像拉取都失败: {', '.join(skipped)}"
 
-        # 4. 拉取镜像 (10%-60% 进度) (v1.5: sudo)
-        on_progress(15, f"拉取镜像 ({', '.join(sorted(profiles_to_enable))})...")
-        pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
-        exit_code = self.run_command_streaming(
-            pull_cmd,
-            on_line=on_line,
-            is_cancelled=is_cancelled,
-            sudo=True,
-            timeout=1800,
-            on_progress=on_progress,
-            progress_min=15.0,
-            progress_max=60.0,
-        )
-        if is_cancelled and is_cancelled():
-            return False, "用户取消"
-        if exit_code != 0:
-            return False, f"拉取镜像失败 (exit={exit_code})"
-
-        # 5. 启动容器 (60%-95%) (v1.5: sudo, v1.7: 进度细化 60→95%)
+        # 5. 启动容器 (60%-95%) (v1.8: 只 up 成功拉到的 service)
         on_progress(60, "启动容器...")
-        up_cmd = f"cd {remote_dir} && docker compose {profiles_str} up -d"
+        services_str = " ".join(succeeded_pull)
+        up_cmd = f"cd {remote_dir} && docker compose up -d {services_str}"
         exit_code = self.run_command_streaming(
             up_cmd,
             on_line=on_line,
@@ -564,7 +583,11 @@ class NASConnection:
             return False, f"启动失败 (exit={exit_code})"
 
         on_progress(100, "完成")
-        return True, f"已启动 profiles: {', '.join(sorted(profiles_to_enable))}"
+        msg = f"已启动 {len(succeeded_pull)} 个服务"
+        if skipped:
+            msg += f", 跳过 {len(skipped)} 个 (镜像拉取失败): {', '.join(skipped)}"
+        # v1.8: 即便有 skipped 也返回 True (用户拿到的是「能用的部分」)
+        return True, msg
 
     def install_apps(self, selected_apps: List[str], compose_content: str, profile_overrides: Optional[List[str]] = None) -> Tuple[bool, str]:
         """通过 docker compose 部署选中的应用

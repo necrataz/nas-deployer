@@ -611,6 +611,154 @@ def test_run_command_streaming_no_progress_when_callback_none():
     print("✅ test_run_command_streaming_no_progress_when_callback_none (v1.7 backward compat)")
 
 
+# v1.8 新增: 测试 per-service pull, 部分失败不影响其他服务
+def test_install_apps_streaming_partial_failure():
+    """v1.8: 3 个服务, 1 个失败, 仍能 up 其他成功的 (libretv 拉不到场景)"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.user = "necrata"
+    conn.password = "testpwd"
+    conn.client = MagicMock()
+    conn.transport = MagicMock()
+    conn.is_connected = MagicMock(return_value=True)
+
+    # mock exec_command 让 pull svc1 成功, pull svc2 失败, pull svc3 成功, up svc1 svc3 成功
+    call_log = []
+    def fake_exec(cmd, timeout=None, get_pty=None):
+        stdin = MagicMock()
+        stdout = MagicMock()
+        stderr = MagicMock()
+        stdout.channel = MagicMock()
+        # 简单 stdout: 单行 + EOF
+        stdout.readline.side_effect = lambda: ""
+        stderr.readline.side_effect = lambda: ""
+        # 按命令内容决定 exit_code
+        if "pull svc2" in cmd:
+            stdout.channel.recv_exit_status.return_value = 1
+        else:
+            stdout.channel.recv_exit_status.return_value = 0
+        return (stdin, stdout, stderr)
+
+    conn.client.exec_command.side_effect = fake_exec
+
+    with patch("paramiko.SFTPClient.from_transport") as mock_sftp_cls:
+        mock_sftp = MagicMock()
+        mock_sftp_cls.return_value = mock_sftp
+        mock_sftp.open.return_value.__enter__.return_value = MagicMock()
+
+        ok, msg = conn.install_apps_streaming(
+            ["svc1", "svc2", "svc3"],
+            "dummy compose",
+            on_line=lambda l: None,
+            on_progress=lambda p, s: None,
+            is_cancelled=None,
+        )
+
+    # v1.8: 部分失败仍返回 True, msg 包含跳过信息
+    assert ok is True, f"expected True (partial success), got ok={ok}, msg={msg}"
+    assert "svc2" in msg, f"msg should mention svc2 skipped, got: {msg}"
+    assert "已启动" in msg, f"msg should say 已启动 N 个, got: {msg}"
+    assert "2 个" in msg, f"msg should mention 2 succeeded, got: {msg}"
+    # 验证 up 命令只 up svc1 svc3
+    up_cmds = [c[0] for c in conn.client.exec_command.call_args_list if "up -d" in c[0][0]]
+    assert len(up_cmds) == 1
+    up_args = up_cmds[0]
+    assert "svc1 svc3" in up_args[0] or "svc3 svc1" in up_args[0], f"up cmd: {up_args[0]}"
+    assert "svc2" not in up_args[0], f"svc2 (failed) should not be up'd: {up_args[0]}"
+    print(f"✅ test_install_apps_streaming_partial_failure (v1.8) — msg: {msg}")
+
+
+def test_pull_apps_streaming_partial_failure():
+    """v1.8: pull_apps_streaming 同样的 per-service 跳过逻辑"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.user = "necrata"
+    conn.password = "testpwd"
+    conn.client = MagicMock()
+    conn.transport = MagicMock()
+    conn.is_connected = MagicMock(return_value=True)
+
+    def fake_exec(cmd, timeout=None, get_pty=None):
+        stdin = MagicMock()
+        stdout = MagicMock()
+        stderr = MagicMock()
+        stdout.channel = MagicMock()
+        stdout.readline.side_effect = lambda: ""
+        stderr.readline.side_effect = lambda: ""
+        if "pull libretv" in cmd:
+            stdout.channel.recv_exit_status.return_value = 1  # libretv 失败
+        else:
+            stdout.channel.recv_exit_status.return_value = 0
+        return (stdin, stdout, stderr)
+
+    conn.client.exec_command.side_effect = fake_exec
+
+    with patch("paramiko.SFTPClient.from_transport") as mock_sftp_cls:
+        mock_sftp = MagicMock()
+        mock_sftp_cls.return_value = mock_sftp
+        mock_sftp.open.return_value.__enter__.return_value = MagicMock()
+
+        ok, msg = conn.pull_apps_streaming(
+            ["qbittorrent", "libretv", "xiaoya"],
+            "dummy compose",
+            on_line=lambda l: None,
+            on_progress=lambda p, s: None,
+            is_cancelled=None,
+        )
+
+    assert ok is True, f"expected True, got ok={ok}"
+    assert "libretv" in msg
+    assert "2 个" in msg  # qbittorrent + xiaoya
+    print(f"✅ test_pull_apps_streaming_partial_failure (v1.8) — msg: {msg}")
+
+
+def test_install_apps_streaming_all_fail():
+    """v1.8: 全部 service 都拉不到 → 返回 False (符合用户预期: 总不能给我一个全空结果)"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.user = "necrata"
+    conn.password = "testpwd"
+    conn.client = MagicMock()
+    conn.transport = MagicMock()
+    conn.is_connected = MagicMock(return_value=True)
+
+    def fake_exec(cmd, timeout=None, get_pty=None):
+        stdin = MagicMock()
+        stdout = MagicMock()
+        stderr = MagicMock()
+        stdout.channel = MagicMock()
+        stdout.readline.side_effect = lambda: ""
+        stderr.readline.side_effect = lambda: ""
+        # 全部 pull 失败
+        stdout.channel.recv_exit_status.return_value = 1
+        return (stdin, stdout, stderr)
+
+    conn.client.exec_command.side_effect = fake_exec
+
+    with patch("paramiko.SFTPClient.from_transport") as mock_sftp_cls:
+        mock_sftp = MagicMock()
+        mock_sftp_cls.return_value = mock_sftp
+        mock_sftp.open.return_value.__enter__.return_value = MagicMock()
+
+        ok, msg = conn.install_apps_streaming(
+            ["svc1", "svc2"],
+            "dummy",
+            on_line=lambda l: None,
+            on_progress=lambda p, s: None,
+            is_cancelled=None,
+        )
+
+    assert ok is False, f"all-fail should return False, got ok={ok}"
+    assert "失败" in msg
+    # 不能 up 任何东西
+    up_cmds = [c[0] for c in conn.client.exec_command.call_args_list if "up -d" in c[0][0]]
+    assert len(up_cmds) == 0, f"should not up anything, got: {up_cmds}"
+    print(f"✅ test_install_apps_streaming_all_fail (v1.8)")
+
+
 if __name__ == "__main__":
     tests = [
         test_connection_success,
@@ -632,6 +780,9 @@ if __name__ == "__main__":
         test_size_unit,                   # v1.7
         test_run_command_streaming_progress_parsing,  # v1.7
         test_run_command_streaming_no_progress_when_callback_none,  # v1.7
+        test_install_apps_streaming_partial_failure,  # v1.8
+        test_pull_apps_streaming_partial_failure,  # v1.8
+        test_install_apps_streaming_all_fail,  # v1.8
     ]
 
     passed = 0
