@@ -169,7 +169,7 @@ def test_run_command_without_sudo():
 
 
 def test_install_apps_profile_mapping():
-    """测试安装时正确解析 profile"""
+    """测试安装时正确解析 profile + v1.4 SFTP fix"""
     from ssh_client import NASConnection
 
     conn = NASConnection()
@@ -177,32 +177,37 @@ def test_install_apps_profile_mapping():
     conn.transport = MagicMock()
     conn.is_connected = MagicMock(return_value=True)
 
-    # 模拟 SFTP 上传成功
-    mock_sftp = MagicMock()
-    conn.transport.open_sftp.return_value = mock_sftp
+    # v1.4 fix: mock paramiko.SFTPClient.from_transport
+    with patch("paramiko.SFTPClient.from_transport") as mock_from_transport:
+        mock_sftp = MagicMock()
+        mock_from_transport.return_value = mock_sftp
+        mock_file = MagicMock()
+        mock_sftp.open.return_value.__enter__.return_value = mock_file
 
-    # 模拟 docker compose 命令成功
-    stdout = MagicMock()
-    stdout.read.return_value = b"Container moviepilot Started"
-    stderr = MagicMock()
-    stderr.read.return_value = b""
-    stdout.channel.recv_exit_status.return_value = 0
-    conn.client.exec_command.return_value = (MagicMock(), stdout, stderr)
+        # 模拟 docker compose 命令成功
+        stdout = MagicMock()
+        stdout.read.return_value = b"Container moviepilot Started"
+        stderr = MagicMock()
+        stderr.read.return_value = b""
+        stdout.channel.recv_exit_status.return_value = 0
+        conn.client.exec_command.return_value = (MagicMock(), stdout, stderr)
 
-    selected = ["moviepilot", "qbittorrent", "libretv", "dashy"]  # movie + nav profile
-    ok, msg = conn.install_apps(selected, "dummy compose")
+        selected = ["moviepilot", "qbittorrent", "libretv", "dashy"]  # movie + nav profile
+        ok, msg = conn.install_apps(selected, "dummy compose")
 
-    assert ok is True, f"Got: {msg}"
-    # 验证执行的命令包含正确 profile
-    calls = conn.client.exec_command.call_args_list
-    cmd_str = " ".join(str(c) for c in calls)
-    assert "--profile movie" in cmd_str, f"Missing movie profile in: {cmd_str}"
-    assert "--profile nav" in cmd_str, f"Missing nav profile in: {cmd_str}"
-    print("✅ test_install_apps_profile_mapping")
+        assert ok is True, f"Got: {msg}"
+        # 验证 compose 上传走的是 from_transport
+        mock_from_transport.assert_called()
+        # 验证执行的命令包含正确 profile
+        calls = conn.client.exec_command.call_args_list
+        cmd_str = " ".join(str(c) for c in calls)
+        assert "--profile movie" in cmd_str, f"Missing movie profile in: {cmd_str}"
+        assert "--profile nav" in cmd_str, f"Missing nav profile in: {cmd_str}"
+        print("✅ test_install_apps_profile_mapping (v1.4 fix)")
 
 
 def test_install_apps_no_selection():
-    """测试没选应用时的处理"""
+    """测试没选应用时的处理 + v1.4 SFTP fix"""
     from ssh_client import NASConnection
 
     conn = NASConnection()
@@ -211,20 +216,22 @@ def test_install_apps_no_selection():
     conn.transport = MagicMock()
     conn.is_connected = MagicMock(return_value=True)
 
-    # mock mkdir 命令成功 + sftp 上传成功
-    stdout = MagicMock()
-    stdout.read.return_value = b""
-    stdout.channel.recv_exit_status.return_value = 0
-    conn.client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
-    mock_sftp = MagicMock()
-    conn.transport.open_sftp.return_value = mock_sftp
-    mock_file = MagicMock()
-    mock_sftp.open.return_value.__enter__.return_value = mock_file
+    # v1.4 fix: mock paramiko.SFTPClient.from_transport
+    with patch("paramiko.SFTPClient.from_transport") as mock_from_transport:
+        # mock mkdir 命令成功
+        stdout = MagicMock()
+        stdout.read.return_value = b""
+        stdout.channel.recv_exit_status.return_value = 0
+        conn.client.exec_command.return_value = (MagicMock(), stdout, MagicMock())
+        mock_sftp = MagicMock()
+        mock_from_transport.return_value = mock_sftp
+        mock_file = MagicMock()
+        mock_sftp.open.return_value.__enter__.return_value = mock_file
 
-    ok, msg = conn.install_apps([], "dummy")
-    assert ok is False
-    assert "没有需要启用" in msg
-    print("✅ test_install_apps_no_selection")
+        ok, msg = conn.install_apps([], "dummy")
+        assert ok is False
+        assert "没有需要启用" in msg
+        print("✅ test_install_apps_no_selection (v1.4 fix)")
 
 
 def test_container_parsing():
@@ -254,7 +261,37 @@ def test_container_parsing():
 
 
 def test_disk_space_parsing():
-    """测试 df -BG 输出解析"""
+    """v1.4 fix: 测扫描所有 mount 取最大, 不再只看根分区"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.user = "necrata"
+    conn.client = MagicMock()
+
+    # 模拟 NAS 多 mount: 根 63G + vol1 1800G + 几个 tmpfs/overlay
+    df_stdout = MagicMock()
+    df_stdout.read.return_value = (
+        b"Filesystem      1G-blocks  Used Available Use% Mounted on\n"
+        b"/dev/sda1           63G   15G       48G  24% /\n"
+        b"tmpfs               16G    1G       15G   6% /tmp\n"
+        b"/dev/sda2         1800G  450G     1350G  25% /vol1\n"
+        b"overlay            100G   20G       80G  20% /var/lib/docker/overlay2/...\n"
+    )
+    df_stderr = MagicMock()
+    df_stderr.read.return_value = b""
+    df_stdout.channel.recv_exit_status.return_value = 0
+    conn.client.exec_command.return_value = (MagicMock(), df_stdout, df_stderr)
+
+    used, total, percent = conn.check_disk_space()
+    # v1.4 应该返回 vol1 (1800G) 而不是 root (63G)
+    assert total == 1800, f"Expected 1800 (largest mount), got {total}"
+    assert used == 450
+    assert percent == 25
+    print("✅ test_disk_space_parsing (v1.4: largest mount)")
+
+
+def test_disk_space_only_root():
+    """只有一个根 mount 时也能工作 (fallback)"""
     from ssh_client import NASConnection
 
     conn = NASConnection()
@@ -263,8 +300,8 @@ def test_disk_space_parsing():
 
     df_stdout = MagicMock()
     df_stdout.read.return_value = (
-        b"Filesystem      1G-blocks  Used Available Use%% Mounted on\n"
-        b"/dev/sda1            500G  120G      380G  24%% /"
+        b"Filesystem      1G-blocks  Used Available Use% Mounted on\n"
+        b"/dev/sda1          500G  120G      380G  24% /\n"
     )
     df_stderr = MagicMock()
     df_stderr.read.return_value = b""
@@ -275,7 +312,7 @@ def test_disk_space_parsing():
     assert total == 500
     assert used == 120
     assert percent == 24
-    print("✅ test_disk_space_parsing")
+    print("✅ test_disk_space_only_root")
 
 
 def test_memory_parsing():
@@ -303,22 +340,33 @@ def test_memory_parsing():
 
 
 def test_upload_content():
-    """测试字符串内容上传"""
+    """v1.4 fix: 测试上传走 paramiko.SFTPClient.from_transport(transport) 而不是 self.transport.open_sftp()
+
+    (paramiko Transport 没 open_sftp() 方法, 之前 Mock 测试假绿)
+    """
     from ssh_client import NASConnection
 
     conn = NASConnection()
     conn.transport = MagicMock()
-    mock_sftp = MagicMock()
-    conn.transport.open_sftp.return_value = mock_sftp
 
-    mock_file = MagicMock()
-    mock_sftp.open.return_value.__enter__.return_value = mock_file
+    # Mock paramiko.SFTPClient.from_transport 来返回 mock SFTP
+    with patch("paramiko.SFTPClient.from_transport") as mock_from_transport:
+        mock_sftp = MagicMock()
+        mock_from_transport.return_value = mock_sftp
+        mock_file = MagicMock()
+        mock_sftp.open.return_value.__enter__.return_value = mock_file
 
-    ok, msg = conn.upload_content("test content", "/tmp/test.yml")
-    assert ok is True
-    assert "/tmp/test.yml" in msg
-    mock_sftp.open.assert_called_with("/tmp/test.yml", "w")
-    print("✅ test_upload_content")
+        ok, msg = conn.upload_content("test content", "/tmp/test.yml")
+
+        assert ok is True, f"Got: {msg}"
+        assert "/tmp/test.yml" in msg
+        # 验证走的是 paramiko.SFTPClient.from_transport(transport)
+        mock_from_transport.assert_called_once_with(conn.transport)
+        mock_sftp.open.assert_called_with("/tmp/test.yml", "w")
+        mock_file.write.assert_called_with("test content")
+        # 验证 transport.open_sftp() 没被调 (paramiko 没用这个方法)
+        conn.transport.open_sftp.assert_not_called()
+        print("✅ test_upload_content (v1.4: paramiko.SFTPClient.from_transport)")
 
 
 def test_disconnect():
@@ -365,6 +413,7 @@ if __name__ == "__main__":
         test_install_apps_no_selection,
         test_container_parsing,
         test_disk_space_parsing,
+        test_disk_space_only_root,
         test_memory_parsing,
         test_upload_content,
         test_disconnect,

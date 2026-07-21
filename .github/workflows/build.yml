@@ -50,6 +50,23 @@ jobs:
           name: NASDeployer-Windows-EXE
           path: dist/NASDeployer.exe
 
+      # v1.4 加 smoke test: 启动 EXE 看是否崩溃
+      # (v1.1 build 成功但 ttkbootstrap 字体缺失导致启动崩溃, 这种 build-time 假绿被这步抓)
+      - name: Smoke test EXE (verify startup)
+        shell: pwsh
+        run: |
+          $exe = "dist\NASDeployer.exe"
+          Write-Host "Starting $exe ..."
+          $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 8
+          if ($proc.HasExited) {
+              Write-Host "::error::EXE exited within 8 seconds (exit code: $($proc.ExitCode))"
+              exit 1
+          }
+          Write-Host "EXE still running after 8 seconds (PID $($proc.Id))"
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+
+      # tag push 时自动 attach 到 release
       - name: Attach to release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2

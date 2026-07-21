@@ -224,17 +224,21 @@ class NASConnection:
             return False, f"上传失败: {e}"
 
     def upload_content(self, content: str, remote_path: str) -> Tuple[bool, str]:
-        """直接上传字符串内容到远程文件"""
+        """直接上传字符串内容到远程文件
+
+        v1.4 fix: 改用 paramiko.SFTPClient.from_transport(transport)
+        之前用 self.transport.open_sftp() 是错的, paramiko Transport 没有这方法
+        """
         if not self.transport:
             return False, "未连接"
         try:
-            sftp = self.transport.open_sftp()
+            sftp = paramiko.SFTPClient.from_transport(self.transport)
             with sftp.open(remote_path, "w") as f:
                 f.write(content)
             sftp.close()
             return True, f"已写入 {remote_path}"
         except Exception as e:
-            return False, f"上传失败: {e}"
+            return False, f"上传失败: {type(e).__name__}: {e}"
 
     # -------------------- Docker 操作 --------------------
     def get_installed_containers(self) -> List[Dict[str, str]]:
@@ -277,6 +281,69 @@ class NASConnection:
                 "ports": parts[3] if len(parts) > 3 else "",
             })
         return containers
+
+    def pull_apps_streaming(
+        self,
+        selected_apps: List[str],
+        compose_content: str,
+        on_line,
+        on_progress,
+        is_cancelled=None,
+        profile_overrides: Optional[List[str]] = None,
+    ) -> Tuple[bool, str]:
+        """流式版 pull_apps, 只跑 docker compose pull 不启动容器
+
+        用于 v1.1+ 进度窗口的实时日志展示
+        (v1.4 拆自 install_apps_streaming, 之前 _pull_thread 用 echo 写假 compose 被 docker 当 YAML 解析崩)
+
+        on_line(line: str) - 每行输出
+        on_progress(percent: float, stage: str) - 阶段进度
+        is_cancelled() -> bool - worker 线程轮询
+        """
+        if not self.is_connected():
+            return False, "未连接"
+
+        # 1. 创建临时目录 + 上传真实 compose (v1.4 fix: 不能用 placeholder)
+        on_progress(10, "上传 docker-compose.yml...")
+        remote_dir = "/tmp/nas_deploy"
+        remote_compose = f"{remote_dir}/docker-compose.yml"
+
+        exit_code, output = self.run_command(f"mkdir -p {remote_dir}")
+        if exit_code != 0:
+            return False, f"创建目录失败: {output}"
+
+        ok, msg = self.upload_content(compose_content, remote_compose)
+        if not ok:
+            return False, f"上传 compose 失败: {msg}"
+
+        # 2. 解析要拉的 profile
+        from apps import APPS
+        profiles_to_pull = set()
+        if profile_overrides:
+            profiles_to_pull.update(profile_overrides)
+        else:
+            for app_key in selected_apps:
+                if app_key in APPS:
+                    profiles_to_pull.add(APPS[app_key]["profile"])
+
+        if not profiles_to_pull:
+            return False, "没有需要拉取的 profile"
+
+        profiles_str = " ".join(f"--profile {p}" for p in profiles_to_pull)
+
+        # 3. 拉取镜像
+        on_progress(20, f"拉取镜像 ({', '.join(sorted(profiles_to_pull))})...")
+        pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
+        exit_code = self.run_command_streaming(
+            pull_cmd, on_line=on_line, is_cancelled=is_cancelled, timeout=1800
+        )
+        if is_cancelled and is_cancelled():
+            return False, "用户取消"
+        if exit_code != 0:
+            return False, f"拉取镜像失败 (exit={exit_code})"
+
+        on_progress(100, "完成")
+        return True, f"已拉取 profiles: {', '.join(sorted(profiles_to_pull))}"
 
     def install_apps_streaming(
         self,
@@ -490,23 +557,45 @@ class NASConnection:
         return output if exit_code == 0 else f"获取日志失败: {output}"
 
     def check_disk_space(self) -> Tuple[int, int, int]:
-        """返回 (used_gb, total_gb, percent)"""
-        exit_code, output = self.run_command("df -BG / | tail -1", timeout=10)
+        """返回最大文件系统的 (used_gb, total_gb, percent)
+
+        v1.4 fix: 之前用 "df -BG /" 只看根分区 (e.g. 系统盘 63G),
+        但 NAS 大容量硬盘通常挂载在 /vol1, /vol2, /mnt/disk1 等
+        → 现在扫所有 mount 取最大的, 才是用户真正关心的容量
+        """
+        exit_code, output = self.run_command("df -BG", timeout=10)
         if exit_code != 0:
             return 0, 0, 0
-        # 解析最后一行: /dev/sda1  100G  50G  50G  50%  /
-        # 必须取最后一行 (不要被 header line 污染)
-        last_line = output.strip().split("\n")[-1]
-        parts = last_line.split()
-        if len(parts) >= 5:
+
+        best_used = best_total = best_percent = 0
+        for line in output.strip().split("\n"):
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            # 跳 header
+            if parts[0].lower() == "filesystem":
+                continue
+            # 跳虚拟 / tmpfs / overlay (e.g. Docker overlay2)
+            mount = parts[5] if len(parts) > 5 else ""
+            if mount.startswith("/proc") or mount.startswith("/sys") or mount == "/dev" or mount == "/dev/shm":
+                continue
+            # 跳 tmpfs / overlay / squashfs
+            fstype_hint = parts[0]
+            if any(fs in fstype_hint.lower() for fs in ["tmpfs", "overlay", "squashfs", "devtmpfs"]):
+                continue
             try:
                 total = int(parts[1].rstrip("G"))
                 used = int(parts[2].rstrip("G"))
-                percent = int(parts[4].rstrip("%"))
-                return used, total, percent
+                percent_str = parts[4].rstrip("%")
+                percent = int(percent_str)
+                if total > best_total:
+                    best_total = total
+                    best_used = used
+                    best_percent = percent
             except (ValueError, IndexError):
-                pass
-        return 0, 0, 0
+                continue
+
+        return best_used, best_total, best_percent
 
     def check_memory(self) -> Tuple[int, int, int]:
         """返回 (used_mb, total_mb, percent)"""
