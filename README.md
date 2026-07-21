@@ -2,12 +2,28 @@
 
 Windows 桌面 GUI 工具，一键部署 26 个 Docker 应用到飞牛 OS (fnOS) 或极空间 (ZSpace)。
 
+## v1.1 新增功能
+
+- **多 NAS profile 切换**: 顶部 dropdown 切换 fnOS/ZSpace 等多个 NAS
+- **keyring 密码自动保存**: 密码存 Windows Credential Manager, 二次启动自动填
+- **实时进度窗口**: 安装/拉取镜像时弹进度条 + 实时日志流, 可取消
+- **应用搜索 + 分组折叠**: 搜索框 + "仅显示已选" + 全选/全不选按钮
+
+## v1.1 迁移
+
+v1.0 的单 NAS 配置 `~/.nas_deployer/config.json` 自动迁移到 v1.1 的多 NAS profile, 无需手动操作.
+
 ## 功能
 
+- **多 NAS 管理**: dropdown 切换, ➕/✏️/🗑 增删改
+- **密码安全**: keyring (Windows Credential Manager) 加密存储
 - **图形化输入** NAS IP / 用户名 / 密码
 - **SSH 连接 + Docker Compose 自动部署**
 - **按 profile 分组管理**：🎬 movie / 📚 read / 🎵 pt / 🧭 nav / 🤖 ai / 🎨 draw / 📰 news / 📺 tv / 🔧 tools
 - **应用原子操作**：安装 / 停止 / 重启 / 拉取最新镜像
+- **实时进度窗口**: docker compose pull/up 输出逐行显示, 可中途取消
+- **应用搜索**: 名称/描述/ID 模糊匹配
+- **仅显示已选**: 隐藏未勾选的应用, 方便管理大批量
 - **实时日志** + 容器状态查看
 - **NAS 资源监控**（磁盘 / 内存）
 - **容器右键菜单**：日志 / 重启 / 停止
@@ -43,18 +59,20 @@ build.bat
 ## 使用流程
 
 1. **打开 EXE**
-2. **连接 Tab**：
-   - 选择 NAS 类型 (fnOS / ZSpace)
-   - 输入 IP、端口、用户名、密码
-   - 点击 "测试连接"
-3. **应用 Tab**：
-   - 勾选 Profile (整组勾选) 或单独勾选应用
-   - 点击 "▶ 安装选中"
-4. **状态 Tab**：
+2. **顶部栏**: 点 `➕` 添加 NAS (或选已添加的)
+   - 名称 / 类型 / IP / 端口 / 用户名, 保存
+3. **连接 Tab**:
+   - 选好 NAS, 输入密码 (可勾选 "保存到 keyring")
+   - 点 "🔌 测试并连接"
+4. **应用 Tab**:
+   - 搜索框过滤应用
+   - 勾选 Profile (整组勾选) 或单独勾选
+   - 点 "▶ 安装选中" → 弹进度窗口看实时日志
+5. **状态 Tab**:
    - 查看容器状态
    - 右键查看日志 / 重启 / 停止
-5. **日志 Tab**：
-   - 实时查看部署日志
+6. **日志 Tab**:
+   - 实时查看所有操作的日志
 
 ## 前置条件（NAS 端）
 
@@ -99,10 +117,15 @@ build.bat
 ```
 nas_deployer/
 ├── src/
-│   ├── app.py              # 主 GUI (ttkbootstrap)
-│   ├── ssh_client.py       # SSH + Docker 编排
+│   ├── app.py              # 主 GUI (ttkbootstrap, 多 NAS + 搜索)
+│   ├── ssh_client.py       # SSH + Docker 编排 (含流式命令)
 │   ├── apps.py             # 26 服务元数据
-│   └── compose_data.py     # 内嵌 docker-compose.yml
+│   ├── compose_data.py     # 内嵌 docker-compose.yml
+│   ├── nas_profile.py      # 多 NAS profile 管理 + keyring
+│   └── progress_window.py  # 进度条 + 实时日志流窗口
+├── tests/
+│   ├── test_ssh_client.py  # SSH mock 测试
+│   └── test_nas_profile.py # NAS profile + keyring 测试
 ├── .github/
 │   └── workflows/
 │       └── build.yml       # GitHub Actions CI
@@ -114,7 +137,8 @@ nas_deployer/
 
 ## 配置存储
 
-`~/.nas_deployer/config.json` 存储 NAS 连接信息（**密码不保存**，每次输入）。
+- `~/.nas_deployer/profiles.json` - NAS profile 列表 (不含密码)
+- 密码存系统 keyring (Windows Credential Manager) - `keyring set NASDeployer <profile_id>`
 
 ## 已知问题
 

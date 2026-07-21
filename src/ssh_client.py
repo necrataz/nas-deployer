@@ -131,6 +131,86 @@ class NASConnection:
         except Exception as e:
             return -1, f"执行异常: {type(e).__name__}: {e}"
 
+    def run_command_streaming(
+        self,
+        command: str,
+        on_line,
+        is_cancelled=None,
+        sudo: bool = False,
+        timeout: int = 60,
+    ) -> int:
+        """流式执行命令, 每行通过 on_line 回调实时推送
+
+        用于 v1.1+ 进度窗口的实时日志展示:
+        - on_line(line: str) - 每收到一行输出调用一次
+        - is_cancelled() -> bool - worker 线程轮询, 返回 True 时主动关闭 channel 中断命令
+        - timeout - 单行最长等待时间 (秒), 超时也退出循环
+
+        返回: 命令 exit_code (取消时返回 -1)
+        """
+        if not self.client:
+            on_line("[ERROR] 未连接")
+            return -1
+
+        use_sudo = sudo and self.user != "root"
+        actual_cmd = f"sudo -S {command}" if use_sudo else command
+
+        try:
+            import time
+            stdin, stdout, stderr = self.client.exec_command(
+                actual_cmd, timeout=timeout, get_pty=use_sudo
+            )
+
+            if use_sudo:
+                stdin.write(self.password + "\n")
+                stdin.flush()
+
+            # 逐行读 stdout (阻塞, 但 worker 线程所以不会冻 UI)
+            start = time.time()
+            exit_code = -1
+            cancelled = False
+
+            for line in iter(stdout.readline, ""):
+                # 取消检查 (在每行之间)
+                if is_cancelled and is_cancelled():
+                    try:
+                        stdout.channel.close()
+                    except Exception:
+                        pass
+                    on_line("[INFO] 命令已被用户取消")
+                    cancelled = True
+                    break
+                on_line(line.rstrip("\n"))
+                # 单行超时保护
+                if time.time() - start > timeout:
+                    on_line(f"[WARN] 命令超过 {timeout}s 超时, 中断读取")
+                    try:
+                        stdout.channel.close()
+                    except Exception:
+                        pass
+                    break
+
+            if not cancelled:
+                # 尝试取 exit_code (可能因 channel 关闭而抛异常)
+                try:
+                    exit_code = stdout.channel.recv_exit_status()
+                except Exception:
+                    exit_code = -1
+
+                # stderr 也读一下
+                try:
+                    for line in iter(stderr.readline, ""):
+                        if line.strip():
+                            on_line(f"[STDERR] {line.rstrip(chr(10))}")
+                except Exception:
+                    pass
+
+            return exit_code
+
+        except Exception as e:
+            on_line(f"[EXCEPTION] {type(e).__name__}: {e}")
+            return -1
+
     # -------------------- 文件传输 --------------------
     def upload_file(self, local_path: str, remote_path: str) -> Tuple[bool, str]:
         """SCP 上传文件"""
@@ -197,6 +277,83 @@ class NASConnection:
                 "ports": parts[3] if len(parts) > 3 else "",
             })
         return containers
+
+    def install_apps_streaming(
+        self,
+        selected_apps: List[str],
+        compose_content: str,
+        on_line,
+        on_progress,
+        is_cancelled=None,
+        profile_overrides: Optional[List[str]] = None,
+    ) -> Tuple[bool, str]:
+        """流式版 install_apps, 用于 v1.1+ 进度窗口实时日志
+
+        流程:
+        1. 上传 docker-compose.yml (快)
+        2. docker compose pull (慢, 实时日志)
+        3. docker compose up -d (慢, 实时日志)
+
+        on_line(line: str) - 每行输出
+        on_progress(percent: float, stage: str) - 阶段进度 (0-100)
+        is_cancelled() -> bool - worker 线程轮询
+        """
+        if not self.is_connected():
+            return False, "未连接"
+
+        # 1. 创建临时目录
+        on_progress(5, "准备远程目录...")
+        remote_dir = "/tmp/nas_deploy"
+        exit_code, output = self.run_command(f"mkdir -p {remote_dir}")
+        if exit_code != 0:
+            return False, f"创建目录失败: {output}"
+
+        # 2. 上传 compose 文件
+        on_progress(10, "上传 docker-compose.yml...")
+        remote_compose = f"{remote_dir}/docker-compose.yml"
+        ok, msg = self.upload_content(compose_content, remote_compose)
+        if not ok:
+            return False, f"上传 compose 失败: {msg}"
+
+        # 3. 解析需要启用的 profile
+        from apps import APPS
+        profiles_to_enable = set()
+        if profile_overrides:
+            profiles_to_enable.update(profile_overrides)
+        else:
+            for app_key in selected_apps:
+                if app_key in APPS:
+                    profiles_to_enable.add(APPS[app_key]["profile"])
+
+        if not profiles_to_enable:
+            return False, "没有需要启用的 profile"
+
+        profiles_str = " ".join(f"--profile {p}" for p in profiles_to_enable)
+
+        # 4. 拉取镜像 (10%-60% 进度)
+        on_progress(15, f"拉取镜像 ({', '.join(sorted(profiles_to_enable))})...")
+        pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
+        exit_code = self.run_command_streaming(
+            pull_cmd, on_line=on_line, is_cancelled=is_cancelled, timeout=1800
+        )
+        if is_cancelled and is_cancelled():
+            return False, "用户取消"
+        if exit_code != 0:
+            return False, f"拉取镜像失败 (exit={exit_code})"
+
+        # 5. 启动容器 (60%-95%)
+        on_progress(65, "启动容器...")
+        up_cmd = f"cd {remote_dir} && docker compose {profiles_str} up -d"
+        exit_code = self.run_command_streaming(
+            up_cmd, on_line=on_line, is_cancelled=is_cancelled, timeout=600
+        )
+        if is_cancelled and is_cancelled():
+            return False, "用户取消"
+        if exit_code != 0:
+            return False, f"启动失败 (exit={exit_code})"
+
+        on_progress(100, "完成")
+        return True, f"已启动 profiles: {', '.join(sorted(profiles_to_enable))}"
 
     def install_apps(self, selected_apps: List[str], compose_content: str, profile_overrides: Optional[List[str]] = None) -> Tuple[bool, str]:
         """通过 docker compose 部署选中的应用
