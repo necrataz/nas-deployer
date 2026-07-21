@@ -1,11 +1,28 @@
 # ==============================================================================
-# NAS 一键部署工具 - SSH + Docker 编排
+# NAS Deployer v1.7 - SSH + Docker 编排
+# v1.7 新增:
+#   1. run_command_streaming 新增 on_progress / progress_min / progress_max 参数
+#   2. 解析 docker compose v2 输出 "Pulling X/Y" / "Downloading X MB / Y MB"
+#   3. _size_unit helper 处理字节单位换算
 # ==============================================================================
 
 import paramiko
 from scp import SCPClient
 from typing import Tuple, Optional, List, Dict
 import io
+
+
+# v1.7: 字节单位换算 (用于解析 docker compose 下载进度 "5MB/20MB")
+def _size_unit(unit: str) -> int:
+    """KB/MB/GB → 字节倍数, 未知单位返回 1 (避免除零)"""
+    u = (unit or "").upper()
+    if u == "KB":
+        return 1024
+    if u == "MB":
+        return 1024 * 1024
+    if u == "GB":
+        return 1024 * 1024 * 1024
+    return 1
 
 
 class NASConnection:
@@ -161,6 +178,9 @@ class NASConnection:
         is_cancelled=None,
         sudo: bool = False,
         timeout: int = 60,
+        on_progress=None,
+        progress_min: float = 0.0,
+        progress_max: float = 100.0,
     ) -> int:
         """流式执行命令, 每行通过 on_line 回调实时推送
 
@@ -169,6 +189,11 @@ class NASConnection:
         - is_cancelled() -> bool - worker 线程轮询, 返回 True 时主动关闭 channel 中断命令
         - sudo - 是否用 sudo (v1.6 fix: 自动包进 sh -c 让 cd 等 builtin 跑)
         - timeout - 单行最长等待时间 (秒), 超时也退出循环
+
+        v1.7 新增:
+        - on_progress(percent, stage) - 可选回调, 解析 docker compose 输出中的
+          "Pulling X/Y" / "X/Y MB" / "Downloading" 等行推算进度 (在 progress_min-max 内)
+        - heartbeat: 长时间无新行时 (10s+) 不强制写, 但 on_line 应该外部调用 heartbeat()
 
         返回: 命令 exit_code (取消时返回 -1)
         """
@@ -185,6 +210,7 @@ class NASConnection:
             actual_cmd = command
 
         try:
+            import re
             import time
             stdin, stdout, stderr = self.client.exec_command(
                 actual_cmd, timeout=timeout, get_pty=use_sudo
@@ -199,6 +225,36 @@ class NASConnection:
             exit_code = -1
             cancelled = False
 
+            # v1.7: 进度解析状态
+            pull_total = 0      # docker compose pull 输出 "Pulling fs layer" 总数
+            pull_done = 0       # 已完成的 layer 数
+            last_progress_pct = -1.0  # 上次推过的 percent, 避免重复推
+
+            # docker compose 输出示例:
+            #   "Pulling 3 / 4"                       (compose v2)
+            #   "Pulling fs layer"                     (compose v1 / pull 阶段)
+            #   "Downloading [==>     ]  5MB/20MB"     (compose pull)
+            #   "Extracting [===>     ]  5MB/20MB"     (compose pull)
+            #   "Pull complete"                        (完成一个 layer)
+            RE_PULLING_V2 = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")  # "3 / 4"
+            RE_DL_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*([KMG]?B)\s*/\s*(\d+(?:\.\d+)?)\s*([KMG]?B)")
+
+            def _emit_progress(pct: float, stage: str):
+                nonlocal last_progress_pct
+                if on_progress is None:
+                    return
+                # 映射到 [progress_min, progress_max] 区间
+                mapped = progress_min + (progress_max - progress_min) * (pct / 100.0)
+                mapped = max(progress_min, min(progress_max, mapped))
+                # 避免抖动 (相同 percent 不重复推)
+                if abs(mapped - last_progress_pct) < 0.5:
+                    return
+                last_progress_pct = mapped
+                try:
+                    on_progress(mapped, stage)
+                except Exception:
+                    pass
+
             for line in iter(stdout.readline, ""):
                 # 取消检查 (在每行之间)
                 if is_cancelled and is_cancelled():
@@ -209,7 +265,45 @@ class NASConnection:
                     on_line("[INFO] 命令已被用户取消")
                     cancelled = True
                     break
-                on_line(line.rstrip("\n"))
+                stripped = line.rstrip("\n")
+                on_line(stripped)
+
+                # v1.7: 解析 docker compose v2 的 "Pulling X / Y" 进度
+                if on_progress is not None and pull_total > 0:
+                    pass  # 状态走 pull_done / pull_total
+
+                # "Pulling X / Y" — docker compose v2 主进度信号
+                if "Pulling" in stripped and "/" in stripped:
+                    m = RE_PULLING_V2.search(stripped.split("Pulling", 1)[-1])
+                    if m:
+                        cur, total = int(m.group(1)), int(m.group(2))
+                        if total > pull_total:
+                            pull_total = total
+                        pct = (cur / total) * 100 if total else 0
+                        # 镜像进度用 60% 区间, 留给后面 "启动容器" 阶段
+                        _emit_progress(pct * 0.6, f"拉取镜像 {cur}/{total}")
+                        # v1.7: 把 pull_done 同步到 cur (避免后面 Pull complete 倒退)
+                        if cur > pull_done:
+                            pull_done = cur
+
+                # "Pull complete" / "Already up to date" — 单 layer 完成, 但不要倒退
+                if ("Pull complete" in stripped or "Already up to date" in stripped) and pull_total > 0:
+                    if pull_done < pull_total:
+                        pull_done += 1
+                    pct = (pull_done / pull_total) * 100
+                    _emit_progress(pct * 0.6, f"拉取完成 {pull_done}/{pull_total}")
+
+                # 下载/解压百分比 (单 layer 内部进度)
+                if "Downloading" in stripped or "Extracting" in stripped:
+                    m = RE_DL_PCT.search(stripped)
+                    if m:
+                        cur_v = float(m.group(1)) * _size_unit(m.group(2))
+                        total_v = float(m.group(3)) * _size_unit(m.group(4))
+                        if total_v > 0:
+                            layer_pct = (cur_v / total_v) * 100
+                            # 单 layer 进度作为辅助显示 (不覆盖 pulling X/Y)
+                            _emit_progress(min(60, layer_pct * 0.6), stripped[:50])
+
                 # 单行超时保护
                 if time.time() - start > timeout:
                     on_line(f"[WARN] 命令超过 {timeout}s 超时, 中断读取")
@@ -360,11 +454,18 @@ class NASConnection:
 
         profiles_str = " ".join(f"--profile {p}" for p in profiles_to_pull)
 
-        # 3. 拉取镜像 (v1.5: sudo 因为 docker socket 权限)
+        # 3. 拉取镜像 (v1.5: sudo 因为 docker socket 权限, v1.7: 进度细化 20→80%)
         on_progress(20, f"拉取镜像 ({', '.join(sorted(profiles_to_pull))})...")
         pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
         exit_code = self.run_command_streaming(
-            pull_cmd, on_line=on_line, is_cancelled=is_cancelled, sudo=True, timeout=1800
+            pull_cmd,
+            on_line=on_line,
+            is_cancelled=is_cancelled,
+            sudo=True,
+            timeout=1800,
+            on_progress=on_progress,
+            progress_min=20.0,
+            progress_max=80.0,
         )
         if is_cancelled and is_cancelled():
             return False, "用户取消"
@@ -430,18 +531,32 @@ class NASConnection:
         on_progress(15, f"拉取镜像 ({', '.join(sorted(profiles_to_enable))})...")
         pull_cmd = f"cd {remote_dir} && docker compose {profiles_str} pull"
         exit_code = self.run_command_streaming(
-            pull_cmd, on_line=on_line, is_cancelled=is_cancelled, sudo=True, timeout=1800
+            pull_cmd,
+            on_line=on_line,
+            is_cancelled=is_cancelled,
+            sudo=True,
+            timeout=1800,
+            on_progress=on_progress,
+            progress_min=15.0,
+            progress_max=60.0,
         )
         if is_cancelled and is_cancelled():
             return False, "用户取消"
         if exit_code != 0:
             return False, f"拉取镜像失败 (exit={exit_code})"
 
-        # 5. 启动容器 (60%-95%) (v1.5: sudo)
-        on_progress(65, "启动容器...")
+        # 5. 启动容器 (60%-95%) (v1.5: sudo, v1.7: 进度细化 60→95%)
+        on_progress(60, "启动容器...")
         up_cmd = f"cd {remote_dir} && docker compose {profiles_str} up -d"
         exit_code = self.run_command_streaming(
-            up_cmd, on_line=on_line, is_cancelled=is_cancelled, sudo=True, timeout=600
+            up_cmd,
+            on_line=on_line,
+            is_cancelled=is_cancelled,
+            sudo=True,
+            timeout=600,
+            on_progress=on_progress,
+            progress_min=60.0,
+            progress_max=95.0,
         )
         if is_cancelled and is_cancelled():
             return False, "用户取消"

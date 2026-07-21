@@ -493,6 +493,124 @@ def test_is_connected():
     print("✅ test_is_connected")
 
 
+# v1.7 新增: 测试进度解析功能
+def test_size_unit():
+    """v1.7: _size_unit 字节单位换算"""
+    from ssh_client import _size_unit
+    assert _size_unit("KB") == 1024
+    assert _size_unit("MB") == 1024 * 1024
+    assert _size_unit("GB") == 1024 * 1024 * 1024
+    assert _size_unit("B") == 1
+    assert _size_unit("") == 1
+    assert _size_unit("xyz") == 1  # 未知单位
+    print("✅ test_size_unit (v1.7)")
+
+
+def test_run_command_streaming_progress_parsing():
+    """v1.7: 解析 docker compose 'Pulling X/Y' 推 on_progress, 区间映射正确"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.client = MagicMock()
+    conn.user = "necrata"
+    conn.password = "fake"
+
+    # 模拟 docker compose 输出 (paramiko 真实行为返 str, 不是 bytes)
+    mock_stdin = MagicMock()
+    mock_stdout = MagicMock()
+    mock_stderr = MagicMock()
+    mock_stdout.channel.recv_exit_status.return_value = 0
+
+    lines = [
+        "Pulling 0 / 4\n",
+        "Pulling 1 / 4\n",
+        "Pulling 2 / 4\n",
+        "Pulling 3 / 4\n",
+        "Pulling 4 / 4\n",
+        "Pull complete\n",
+        "",  # EOF
+    ]
+    line_iter = iter(lines)
+    mock_stdout.readline.side_effect = lambda: next(line_iter, "")
+    mock_stderr.readline.return_value = ""
+
+    conn.client.exec_command.return_value = (mock_stdin, mock_stdout, mock_stderr)
+
+    progress_calls = []
+    def on_progress(pct, stage):
+        progress_calls.append((pct, stage))
+
+    lines_received = []
+    def on_line(line):
+        lines_received.append(line)
+
+    exit_code = conn.run_command_streaming(
+        "docker compose pull",
+        on_line=on_line,
+        is_cancelled=None,
+        sudo=False,
+        timeout=30,
+        on_progress=on_progress,
+        progress_min=20.0,
+        progress_max=80.0,
+    )
+
+    assert exit_code == 0, f"Expected 0, got {exit_code}"
+    # 进度被推了 (5 个 Pulling + 1 个 Pull complete = 至少 4 个有效进度事件)
+    assert len(progress_calls) >= 3, f"Expected 3+ progress calls, got {len(progress_calls)}"
+    # 区间映射: "Pulling 0/4" → 0% → 20.0, "Pulling 4/4" → 100% * 0.6 = 60% → 56.0
+    # (镜像阶段占 0-60% 区间, 留给后面 "启动容器" 阶段 60-95%)
+    first_pct = progress_calls[0][0]
+    last_pct = progress_calls[-1][0]
+    assert 19.0 <= first_pct <= 21.0, f"first_pct {first_pct} not ~20"
+    assert 55.0 <= last_pct <= 57.0, f"last_pct {last_pct} not ~56"
+    # 进度单调递增
+    pcts = [p[0] for p in progress_calls]
+    assert pcts == sorted(pcts), f"progress not monotonic: {pcts}"
+    # 日志都收到了
+    assert "Pulling 4 / 4" in lines_received
+    print(f"✅ test_run_command_streaming_progress_parsing (v1.7) — {len(progress_calls)} progress events")
+
+
+def test_run_command_streaming_no_progress_when_callback_none():
+    """v1.7: on_progress=None 时不崩, 不推进度, 行为兼容 v1.6"""
+    from ssh_client import NASConnection
+
+    conn = NASConnection()
+    conn.client = MagicMock()
+    conn.user = "necrata"
+    conn.password = "fake"
+
+    mock_stdin = MagicMock()
+    mock_stdout = MagicMock()
+    mock_stderr = MagicMock()
+    mock_stdout.channel.recv_exit_status.return_value = 0
+
+    lines = ["Pulling 4 / 4\n", "Pull complete\n", ""]
+    line_iter = iter(lines)
+    mock_stdout.readline.side_effect = lambda: next(line_iter, "")
+    mock_stderr.readline.return_value = ""
+
+    conn.client.exec_command.return_value = (mock_stdin, mock_stdout, mock_stderr)
+
+    lines_received = []
+    def on_line(line):
+        lines_received.append(line)
+
+    # 不传 on_progress
+    exit_code = conn.run_command_streaming(
+        "docker compose pull",
+        on_line=on_line,
+        is_cancelled=None,
+        sudo=False,
+        timeout=30,
+    )
+
+    assert exit_code == 0
+    assert "Pulling 4 / 4" in lines_received
+    print("✅ test_run_command_streaming_no_progress_when_callback_none (v1.7 backward compat)")
+
+
 if __name__ == "__main__":
     tests = [
         test_connection_success,
@@ -511,6 +629,9 @@ if __name__ == "__main__":
         test_upload_content,
         test_disconnect,
         test_is_connected,
+        test_size_unit,                   # v1.7
+        test_run_command_streaming_progress_parsing,  # v1.7
+        test_run_command_streaming_no_progress_when_callback_none,  # v1.7
     ]
 
     passed = 0
