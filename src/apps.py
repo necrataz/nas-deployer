@@ -240,6 +240,15 @@ APPS = {
         'memory_mb': 300,
         'category': 'tools',
     },
+    'mihomo': {
+        'name': 'mihomo (Clash.Meta)',
+        'desc': '代理加速 docker pull (GFW 拦 Docker Hub)',
+        'port': 9091,
+        'profile': 'net',
+        'memory_mb': 150,
+        'category': 'tools',
+        'warning': '需在 ./configs/mihomo/config.yaml 填订阅 URL 才能用',
+    },
 }
 
 PROFILES = {
@@ -287,6 +296,11 @@ PROFILES = {
         'name': '🔧 工具组',
         'memory_mb': 800,
         'apps': ['insdown', 'stirling_pdf', 'bilibili_tool'],
+    },
+    'net': {
+        'name': '🌐 网络组',
+        'memory_mb': 150,
+        'apps': ['mihomo'],
     },
 }
 

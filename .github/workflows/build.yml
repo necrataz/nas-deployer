@@ -67,8 +67,19 @@ jobs:
           Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 
       # tag push 时自动 attach 到 release
+      # v2.0.2 修: 先创建 release (无 asset), 用 gh CLI 上传带版本号的资产名
+      # (不改 --name 是因为 smoke test 还在找 dist/NASDeployer.exe)
       - name: Attach to release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/NASDeployer.exe
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release create $tag `
+            --repo ${{ github.repository }} `
+            --title "NAS Deployer $tag" `
+            --notes "EXE 包含 NAS 部署 + 导航聚合 + mihomo 代理" `
+            --generate-notes
+          # 上传时改资产名带版本号
+          Copy-Item dist\NASDeployer.exe -Destination dist\NASDeployer_$tag.exe
+          gh release upload $tag "dist/NASDeployer_$tag.exe" --repo ${{ github.repository }} --clobber
+          gh release upload $tag "dist/NASDeployer.exe" --repo ${{ github.repository }} --clobber

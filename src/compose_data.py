@@ -340,4 +340,22 @@ services:
     environment:
       - TZ=Asia/Shanghai
     networks: [nas_net]
+
+  # ============ NET PROFILE (v2.0.2: 代理加速 docker pull) ============
+  # mihomo (Clash.Meta) 透明代理 — 帮 docker pull 走代理, 解决 GFW 拦 docker.io
+  # 配置在 ./configs/mihomo/config.yaml (用户填订阅 URL)
+  # 用法: 勾选 'net' profile, 启后会在 NAS 上跑 7890 端口代理
+  #       后续 docker pull 走 http://127.0.0.1:7890
+  # UI 控制台: http://<NAS_IP>:9091/ui (yacd)
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: mihomo
+    restart: unless-stopped
+    profiles: ["net", "all"]
+    ports:
+      - "7890:7890"     # HTTP/SOCKS5 mixed proxy
+      - "9091:9091"     # yacd 控制面板
+    volumes:
+      - ./configs/mihomo:/root/.config/mihomo
+    network_mode: host   # 与 docker network 并存; host 模式让 7890 直接是 127.0.0.1
 """

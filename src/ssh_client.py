@@ -577,6 +577,31 @@ class NASConnection:
         if not ok:
             return False, f"上传 compose 失败: {msg}"
 
+        # v2.0.2: 如果包含 mihomo, 先写个最小 config.yaml (没订阅不会真启动, 但容器能起来)
+        # 用户的订阅后续 SSH 上去改
+        if "mihomo" in selected_apps:
+            try:
+                on_line("=== 写入 mihomo 默认配置 (请填订阅 URL 替换) ===")
+                # minimal config — 米家下载/解析器全留空, 但 mihomo 不会 crash
+                mihomo_cfg = """port: 7890
+socks-port: 7891
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 0.0.0.0:9091
+proxies: []
+proxy-providers: {}
+rules:
+  - MATCH,DIRECT
+"""
+                ec, out = self.run_command(
+                    f"mkdir -p {remote_dir}/configs/mihomo && cat > {remote_dir}/configs/mihomo/config.yaml <<'MCMOEOF'\n{mihomo_cfg}MCMOEOF",
+                    sudo=False,
+                )
+                on_line(f"mihomo config 写入: exit={ec}")
+            except Exception as e:
+                on_line(f"[WARN] mihomo config 写入失败: {e}")
+
         # 3. 解析需要启用的 profile (v1.8: 改成逐 service)
         from apps import APPS
         services_to_install = list(selected_apps)
@@ -635,6 +660,33 @@ class NASConnection:
         msg = f"已启动 {len(succeeded_pull)} 个服务"
         if skipped:
             msg += f", 跳过 {len(skipped)} 个 (镜像拉取失败): {', '.join(skipped)}"
+
+        # v2.0.2: 如果装了 mihomo, 自动写 ~/.docker/config.json 让后续 docker pull 走代理
+        if "mihomo" in succeeded_pull:
+            try:
+                on_line("\n=== 配置 docker daemon 走 mihomo 代理 ===")
+                proxy_cmd = """bash -c 'mkdir -p ~/.docker && cat > ~/.docker/config.json <<EOF
+{
+  "proxies": {
+    "default": {
+      "httpProxy": "http://127.0.0.1:7890",
+      "httpsProxy": "http://127.0.0.1:7890",
+      "noProxy": "localhost,127.0.0.1,<NAS_IP>"
+    }
+  }
+}
+EOF'"""
+                # <NAS_IP> 替换占位
+                from host_utils import clean_host as _ch
+                nas_ip = _ch(self.host or "") if self.host else ""
+                proxy_cmd = proxy_cmd.replace("<NAS_IP>", nas_ip)
+                ec, out = self.run_command(proxy_cmd, sudo=False)
+                on_line(f"docker proxy 配置: exit={ec}")
+                if ec == 0:
+                    msg += " | docker 已走 mihomo 代理 (端口 7890)"
+            except Exception as e:
+                on_line(f"[WARN] docker proxy 配置失败: {e}")
+
         # v1.8: 即便有 skipped 也返回 True (用户拿到的是「能用的部分」)
         return True, msg
 

@@ -115,9 +115,11 @@ class NASDeployerApp:
             current = self.profile_mgr.get_current()
             if current:
                 nas_name = current.name
+            # v2.0.2 修: 传 NAS IP 给导航页, 避免误拿本机 IP
+            nas_host = clean_host(current.host) if current else ""
             import threading
-            port = open_navigation_page(installed, nas_name)
-            self._log(f"🧭 导航页已打开 (port {port}, {len(installed)} 个服务)")
+            port = open_navigation_page(installed, nas_name, 0, nas_host)
+            self._log(f"🧭 导航页已打开 (http://{nas_host or '本机'}:{port}, {len(installed)} 个服务)")
         except Exception as e:
             messagebox.showerror("错误", f"打开导航页失败: {type(e).__name__}: {e}")
 

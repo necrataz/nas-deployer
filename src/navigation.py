@@ -1,7 +1,8 @@
 # ==============================================================================
-# NAS Deployer v2.0 - NAS 服务导航聚合
+# NAS Deployer v2.0.2 - NAS 服务导航聚合
 # ==============================================================================
 # v2.0 新增: 一键打开所有已安装服务的统一导航页
+# v2.0.2 修: 链接前缀用 NAS profile IP (不再误拿本机 IP)
 # 原理: 内嵌 HTML 模板 + 内置 HTTP server + webbrowser 打开
 # 用法: NASDeployer 菜单 "🧭 NAS 导航" → 自动开浏览器 → 显示已安装服务卡片墙
 # ==============================================================================
@@ -13,6 +14,44 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, List, Optional
 
 from apps import APPS
+from apps import APPS
+
+
+def resolve_nas_ip(nas_ip: Optional[str] = None) -> str:
+    """v2.0.2: 解析 NAS IP — 优先用参数, 兜底本机
+
+    历史:
+      v2.0 错的: socket.gethostbyname() 拿的是 EXE 所在 Windows IP (192.168.3.X)
+        而 NAS 是 192.168.3.88 (fnos) — 链接全打不开
+      v2.0.2 修: 调度方传 profile.host 进来 (即 NAS address), 不靠本机探测
+    """
+    if nas_ip:
+        # 去掉 host:port 中的 port
+        return clean_host_for_url(nas_ip)
+    # 兜底: 本机 IP (保留兼容老调用)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def clean_host_for_url(host: str) -> str:
+    """剥 host 字段中的 :port 部分 (host_utils.clean_host 是给 SSH 用的, 保留 :port)
+
+    例如: 'necrata@192.168.3.88:22' → '192.168.3.88'
+    """
+    h = (host or "").strip()
+    # 1. 剥 user@
+    if "@" in h:
+        h = h.split("@", 1)[1]
+    # 2. 剥 :port
+    if ":" in h and not h.startswith("["):  # 不是 IPv6
+        h = h.rsplit(":", 1)[0]
+    return h
 
 
 # 分类显示名 + emoji
@@ -28,23 +67,6 @@ CATEGORY_DISPLAY = {
     "pt":     ("📡 PT",  "#7f8c8d"),
     "office": ("💼 办公", "#16a085"),
 }
-
-
-def get_local_ip() -> str:
-    """拿本机局域网 IP (用于拼 NAS 服务的 URL)
-
-    v2.0: 不依赖 socket.gethostbyname — 那个经常返 127.0.0.1
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # 不会真发包, 只是让 OS 选个 interface
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
 
 
 def _render_html(installed_apps: List[str], nas_ip: str, nas_name: str) -> str:
@@ -204,13 +226,14 @@ class _NavHandler(BaseHTTPRequestHandler):
         pass
 
 
-def open_navigation_page(installed_apps: List[str], nas_name: str = "NAS", port: int = 0) -> int:
+def open_navigation_page(installed_apps: List[str], nas_name: str = "NAS", port: int = 0, nas_ip: Optional[str] = None) -> int:
     """开 NAS 导航页
 
     Args:
         installed_apps: 已安装的 service 名列表 (e.g. ['qbittorrent', 'xiaoya'])
         nas_name: NAS 名 (显示在页面标题)
         port: 0 = 自动选可用端口
+        nas_ip: v2.0.2 新增 — NAS IP (从 profile.host 来), 不传则用本机兜底
 
     Returns:
         实际绑定的端口 (用于诊断)
@@ -218,13 +241,13 @@ def open_navigation_page(installed_apps: List[str], nas_name: str = "NAS", port:
     用法:
         from navigation import open_navigation_page
         threading.Thread(
-            target=lambda: open_navigation_page(['qbittorrent'], 'fnos', 0),
+            target=lambda: open_navigation_page(['qbittorrent'], 'fnos', 0, '192.168.3.88'),
             daemon=True
         ).start()
         # 然后 webbrowser.open(f'http://127.0.0.1:{port}')
     """
-    nas_ip = get_local_ip()
-    html = _render_html(installed_apps, nas_ip, nas_name)
+    final_ip = resolve_nas_ip(nas_ip)
+    html = _render_html(installed_apps, final_ip, nas_name)
 
     _NavHandler.html_content = html.encode("utf-8")
 

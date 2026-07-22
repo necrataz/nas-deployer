@@ -1,5 +1,5 @@
 # ==============================================================================
-# 测试: navigation.py v2.0 NAS 导航
+# 测试: navigation.py v2.0 NAS 导航 + v2.0.2 IP 修复
 # ==============================================================================
 
 import sys
@@ -7,13 +7,39 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
-def test_get_local_ip():
-    """v2.0: get_local_ip 返回非空 IP"""
-    from navigation import get_local_ip
-    ip = get_local_ip()
-    assert ip, "should return non-empty IP"
-    assert "." in ip, f"should look like IPv4: {ip}"
-    print(f"✅ test_get_local_ip — {ip}")
+def test_resolve_nas_ip_explicit():
+    """v2.0.2: 显式传 nas_ip → 优先级最高, 即使他是 127.0.0.1 也用他"""
+    from navigation import resolve_nas_ip
+    ip = resolve_nas_ip("192.168.3.88")
+    assert ip == "192.168.3.88", f"expected 192.168.3.88, got {ip}"
+    print(f"✅ test_resolve_nas_ip_explicit — {ip}")
+
+
+def test_resolve_nas_ip_with_user_prefix():
+    """v2.0.2: 'necrata@192.168.3.88:22' → '192.168.3.88' (剥 user@ 和 :port)"""
+    from navigation import resolve_nas_ip
+    ip = resolve_nas_ip("necrata@192.168.3.88:22")
+    assert ip == "192.168.3.88", f"got {ip}"
+    print(f"✅ test_resolve_nas_ip_with_user_prefix — {ip}")
+
+
+def test_resolve_nas_ip_ipv4_only():
+    """v2.0.2: '192.168.3.55' → '192.168.3.55' (没端口无影响)"""
+    from navigation import resolve_nas_ip
+    ip = resolve_nas_ip("192.168.3.55")
+    assert ip == "192.168.3.55", f"got {ip}"
+    print(f"✅ test_resolve_nas_ip_ipv4_only — {ip}")
+
+
+def test_render_html_uses_nas_ip_not_local():
+    """v2.0.2: 渲染 HTML 用调用方的 nas_ip (192.168.3.88) 而不是本机"""
+    from navigation import _render_html
+    html = _render_html(["qbittorrent"], "192.168.3.88", "fnos")
+    # 应该用 192.168.3.88 拼 qBittorrent URL
+    assert "http://192.168.3.88:8080" in html, "missing NAS ip in URL"
+    # 不应出现本机的 192.168.3.X 推测值 (可能是 192.168.3.1 也可能不是)
+    # 关键是 _render_html 本身已被传入 nas_ip, 这里只验证它用参数不读全局
+    print("✅ test_render_html_uses_nas_ip_not_local")
 
 
 def test_render_html_empty():
@@ -73,12 +99,17 @@ def test_open_navigation_page_port():
 
 if __name__ == "__main__":
     tests = [
-        test_get_local_ip,
+        # v2.0.2 IP 修复
+        test_resolve_nas_ip_explicit,
+        test_resolve_nas_ip_with_user_prefix,
+        test_resolve_nas_ip_ipv4_only,
+        test_render_html_uses_nas_ip_not_local,
+        # v2.0 原版保留
         test_render_html_empty,
         test_render_html_grouped,
         test_render_html_warning,
         test_open_navigation_page_port,
-    ]
+    ]  
     passed = 0
     failed = 0
     for t in tests:
