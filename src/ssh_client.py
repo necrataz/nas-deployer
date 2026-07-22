@@ -1,5 +1,5 @@
 # ==============================================================================
-# NAS Deployer v1.9 - SSH + Docker 编排
+# NAS Deployer v2.0.6 - SSH + Docker 编排
 # v1.7 新增:
 #   1. run_command_streaming 新增 on_progress / progress_min / progress_max 参数
 #   2. 解析 docker compose v2 输出 "Pulling X/Y" / "Downloading X MB / Y MB"
@@ -61,19 +61,20 @@ def _build_mihomo_config_from_subscription(subscription_url: str) -> str:
     v2.0.5: 默认屏蔽 BT (BitTorrent) 流量 — 节点商查 BT 必封号, 不能用代理流量下 BT
     v2.0.5.1: 端口/服务范围限制 — mihomo 只服务 NAS 自身, 不劫持内网服务
     v2.0.5.2: 精简规则顺序 — LAN/服务端口前置, GEOIP/MATCH 留兜底, 修代理失效
+    v2.0.6: BT 端口扩展到 49152-65535 (客户端用动态端口绕过), 加 dns, 优化 socket
 
     标准 clash-meta 配置:
     - bind-address: 127.0.0.1 (v2.0.5.1) — mihomo 只监听本机, 不劫持局域网/服务端口
     - proxy-providers 走订阅 URL, health-check 自动测速
     - proxy-groups: URLTest 自动选最快节点 (fallback 用 DIRECT)
     - rules: BT 屏蔽 → NAS 服务端口 DIRECT → 国内直连 → 局域网 DIRECT → 其他走代理
-    - BT 屏蔽规则 (v2.0.5): 标准 trackers + BT 端口直接 REJECT, 不走代理
+    - BT 屏蔽规则 (v2.0.5+v2.0.6): 标准 trackers + BT 端口 (含动态端口) 直接 REJECT, 不走代理
 
     用户后续可以在 yacd (9091) 里手动调整规则
     """
     # yaml 里 url 不需要引号, 但保险起见用单引号包住
     safe_url = subscription_url.strip().replace("'", "")
-    return f"""# NASDeployer v2.0.5.2 自动生成 - mihomo 配置
+    return f"""# NASDeployer v2.0.6 自动生成 - mihomo 配置
 # 订阅 URL: {safe_url[:60]}{'...' if len(safe_url) > 60 else ''}
 # 控制面板: http://<NAS_IP>:9091/ui (yacd)
 #
@@ -96,6 +97,24 @@ mode: rule
 log-level: info
 external-controller: 0.0.0.0:9091
 secret: ""
+
+# v2.0.6: DNS + socket 优化 (让节点商解不出国内域名污染, 减少延迟)
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://1.0.0.1/dns-query
+    - https://8.8.8.8/dns-query
+  proxy-server-nameserver:
+    - https://1.0.0.1/dns-query
+  nameserver-policy:
+    "geosite-cn,private": https://1.0.0.1/dns-query
+
+# v2.0.6: 优化 socket, 让 docker pull 走代理更稳
+socket-listen: tcp://127.0.0.1:7890
+tcp-concurrent: true
 
 # 节点从订阅拉 (yaml/clash 支持的格式)
 proxy-providers:
@@ -128,6 +147,7 @@ proxy-groups:
 # 5) 其他走代理 (NAS 自己拉镜像 + 解锁 GFW)
 rules:
   # ===== 1) BT 屏蔽 (最高优先级, 防节点商查 BT 封号) =====
+  # v2.0.6: BT 客户端会用动态端口 (49152-65535) 绕过固定端口屏蔽, 一并挡掉
   - DST-PORT,6881,REJECT,no-resolve
   - DST-PORT,6882,REJECT,no-resolve
   - DST-PORT,6883,REJECT,no-resolve
@@ -139,6 +159,9 @@ rules:
   - DST-PORT,6889,REJECT,no-resolve
   - DST-PORT,2710,REJECT,no-resolve
   - DST-PORT,41413,REJECT,no-resolve
+  - DST-PORT,6969,REJECT,no-resolve
+  # v2.0.6: BT 动态端口全挡 (Transmission/qBittorrent 备用端口范围)
+  - DST-PORT,49152-65535,REJECT,no-resolve
   - DOMAIN-KEYWORD,tracker,REJECT
   - DOMAIN-KEYWORD,bittorrent,REJECT
   - DOMAIN-KEYWORD,torrent,REJECT

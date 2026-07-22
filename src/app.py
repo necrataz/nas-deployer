@@ -1,6 +1,6 @@
 # ==============================================================================
-# NAS Deployer v1.1 - 主 GUI (ttkbootstrap)
-# 新增: 多 NAS profile 切换 / keyring 密码存储 / 进度窗口 / 应用搜索
+# NAS Deployer v2.0.6 - 主 GUI (ttkbootstrap)
+# 新增: 首页 VPN 一键安装卡片 + mihomo yaml BT 端口扩到 49152-65535 + DNS 优化
 # ==============================================================================
 
 import os
@@ -250,13 +250,45 @@ class NASDeployerApp:
         self._build_logs_tab()
 
     def _build_connection_tab(self):
-        """连接 Tab: 显示当前 NAS 信息 + 密码输入 + 测试/连接/断开"""
+        """连接 Tab: 显示当前 NAS 信息 + 密码输入 + 测试/连接/断开
+        v2.0.6: 顶部加 VPN 一键安装卡片 (醒目位置)
+        """
         tab = ttk.Frame(self.notebook, padding=20)
         self.notebook.add(tab, text="📡 连接")
 
+        # v2.0.6: VPN 一键安装卡片 (红色醒目, 顶部位置)
+        vpn_frame = ttk.LabelFrame(tab, text="🛡 网络代理 (VPN)", padding=15)
+        vpn_frame.grid(row=0, column=0, columnspan=4, sticky=EW, pady=(0, 15))
+
+        ttk.Label(
+            vpn_frame,
+            text="一键安装并配置 mihomo 代理服务",
+            font=("Helvetica", 11, "bold"),
+            foreground="#e74c3c",
+        ).grid(row=0, column=0, sticky=W, padx=5, pady=(0, 4))
+
+        ttk.Label(
+            vpn_frame,
+            text="• 自动装 mihomo 容器 (host 模式, 监听 7890/9091)\n"
+                 "• 自动配置 docker daemon 走代理 (拉镜像不再失败)\n"
+                 "• 默认屏蔽 BT 下载工具 (qbittorrent 等), 防止节点商封号\n"
+                 "• 国内 IP 直连, NAS 服务端口不被劫持",
+            font=("Helvetica", 9),
+            foreground="#7f8c8d",
+            justify=LEFT,
+        ).grid(row=1, column=0, sticky=W, padx=5, pady=(0, 8))
+
+        ttk.Button(
+            vpn_frame,
+            text="🚀 一键安装并配置 VPN",
+            command=self._quick_install_vpn,
+            bootstyle="danger",
+            width=30,
+        ).grid(row=2, column=0, sticky=W, padx=5)
+
         # 当前 NAS 信息 (只读)
         info_frame = ttk.LabelFrame(tab, text="当前 NAS 信息", padding=15)
-        info_frame.grid(row=0, column=0, columnspan=4, sticky=EW, pady=(0, 15))
+        info_frame.grid(row=1, column=0, columnspan=4, sticky=EW, pady=(0, 15))
 
         ttk.Label(info_frame, text="名称:").grid(row=0, column=0, sticky=W, padx=5, pady=5)
         self.info_name = ttk.Label(info_frame, text="—", font=("Helvetica", 11, "bold"))
@@ -778,6 +810,54 @@ class NASDeployerApp:
         self.current_password = None
         self.status_label.config(text="● 未连接", foreground="gray")
         self._log("已断开连接")
+
+    # -------------------- v2.0.6: 一键安装 VPN (mihomo) --------------------
+    def _quick_install_vpn(self):
+        """v2.0.6: 一键安装并配置 mihomo 代理
+
+        全自动流程 (从首页卡片触发):
+        1. 检查 NAS 连接
+        2. 弹窗输入订阅 URL (可多链接, 每行一个)
+        3. 装 mihomo 容器 (host 模式, 监听 7890/9091)
+        4. 写 mihomo.yaml (BT 全屏蔽 + LAN/服务端口 DIRECT)
+        5. 配置 docker daemon 走代理 (~/.docker/config.json)
+        6. 重启 mihomo 让 yaml 生效
+        7. 跑代理自检 7 项 (v2.0.5.2)
+        """
+        if not self.connection.is_connected():
+            messagebox.showerror("错误", "请先连接 NAS")
+            return
+
+        # 弹订阅 URL
+        sub_url = self._ask_mihomo_subscription()
+        if sub_url is None:
+            return  # 用户取消
+        if sub_url == "":
+            sub_url = None  # 暂不填, 用占位 URL
+
+        self._log("=== 一键安装 VPN (mihomo) ===")
+        # v2.0.6: 直接调 _install_selected 的等价流程, 但只装 mihomo + 自动配置 docker proxy
+        threading.Thread(
+            target=self._install_vpn_thread,
+            args=(sub_url,),
+            daemon=True,
+        ).start()
+
+    def _install_vpn_thread(self, mihomo_sub):
+        """v2.0.6: 后台线程 — 装 mihomo + 写 daemon.json + 跑诊断"""
+        progress = ProgressWindow(self.root, title="VPN 安装进度 (实时日志)")
+        try:
+            ok, msg = self.connection.install_apps_streaming(
+                ["mihomo"],
+                DOCKER_COMPOSE_YML,
+                on_line=progress.append_log,
+                on_progress=progress.update_progress,
+                is_cancelled=progress.is_cancelled,
+                mihomo_subscription_url=mihomo_sub,
+            )
+            progress.finish(ok, msg if ok else f"❌ {msg}")
+        except Exception as e:
+            progress.finish(False, f"异常: {e}")
 
     # -------------------- 安装/停止/重启/拉取 (用进度窗口) --------------------
     def _install_selected(self):
