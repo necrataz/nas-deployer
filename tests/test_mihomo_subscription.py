@@ -100,6 +100,33 @@ def test_app_typing_imports():
     print("✅ test_app_typing_imports — Optional 已 import")
 
 
+def test_app_dialogs_auto_size():
+    """v2.0.4.2 regression: 所有弹窗必须 update_idletasks + winfo_reqwidth 自适应
+    否则用户得每次拖拽窗口才能看全"""
+    src = os.path.join(os.path.dirname(__file__), "..", "src", "app.py")
+    with open(src) as f:
+        content = f.read()
+    # 找所有 Toplevel 弹窗的 method 定义
+    import re
+    dialog_methods = re.findall(r"def _(\w*dialog\w*)\(self\)|def _ask_(\w+)\(self\)", content)
+    # 也直接扫描 mihomo 弹窗和 credentials 弹窗
+    for keyword in ["_ask_mihomo_subscription", "_show_credentials_dialog"]:
+        # 找方法体范围
+        idx = content.find(f"def {keyword}")
+        assert idx > 0, f"{keyword} not found"
+        # 找下一个 def (方法结束)
+        next_def = content.find("\n    def _", idx + 10)
+        if next_def < 0:
+            next_def = len(content)
+        block = content[idx:next_def]
+        # 验证关键调用
+        assert "update_idletasks" in block, f"{keyword}: 缺 update_idletasks"
+        assert "winfo_reqwidth" in block, f"{keyword}: 缺 winfo_reqwidth 自适应宽度"
+        assert "winfo_reqheight" in block, f"{keyword}: 缺 winfo_reqheight 自适应高度"
+        assert "minsize" in block, f"{keyword}: 缺 minsize 最小尺寸保护"
+    print("✅ test_app_dialogs_auto_size — mihomo + credentials 都自适应尺寸")
+
+
 if __name__ == "__main__":
     tests = [
         test_build_mihomo_config_basic,
@@ -108,6 +135,7 @@ if __name__ == "__main__":
         test_install_apps_streaming_accepts_mihomo_url,
         test_install_apps_streaming_uses_url_when_provided,
         test_app_typing_imports,
+        test_app_dialogs_auto_size,
     ]
     passed = 0
     failed = 0
