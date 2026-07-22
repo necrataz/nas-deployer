@@ -33,7 +33,7 @@ from host_utils import clean_host, extract_port_from_host  # v1.3: host 字段�
 
 
 # 全局常量
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.3"
 APP_NAME = "NAS 一键部署工具"
 
 # 旧版单 NAS 配置 (v1.0), 仅用于一次性迁移
@@ -88,6 +88,11 @@ class NASDeployerApp:
         nav_menu.add_command(label="🧭 打开 NAS 服务导航", command=self._open_navigation_page)
         menubar.add_cascade(label="导航", menu=nav_menu)
 
+        # v2.0.3 新增: 默认凭证菜单
+        cred_menu = tk.Menu(menubar, tearoff=0)
+        cred_menu.add_command(label="🔑 查询默认凭证...", command=self._show_credentials_dialog)
+        menubar.add_cascade(label="凭证", menu=cred_menu)
+
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="关于", command=self._show_about)
         help_menu.add_command(label="重置 NAS 列表", command=self._reset_profiles)
@@ -122,6 +127,68 @@ class NASDeployerApp:
             self._log(f"🧭 导航页已打开 (http://{nas_host or '本机'}:{port}, {len(installed)} 个服务)")
         except Exception as e:
             messagebox.showerror("错误", f"打开导航页失败: {type(e).__name__}: {e}")
+
+    # -------------------- v2.0.3 默认凭证查询 --------------------
+    def _show_credentials_dialog(self):
+        """v2.0.3: 弹窗选应用 → 显示默认账号密码"""
+        try:
+            from credentials import list_all_credentials, format_credentials_display, get_credentials
+            from apps import APPS
+
+            # 取当前 NAS IP (没连 NAS 也能查, 用 placeholder)
+            current = self.profile_mgr.get_current()
+            nas_ip = clean_host(current.host) if current else "<NAS_IP>"
+
+            # 弹窗: 下拉选应用 → 显示凭证
+            top = tk.Toplevel(self.root)
+            top.title("🔑 默认凭证查询")
+            top.geometry("600x500")
+            top.transient(self.root)
+
+            # 顶部: 应用选择
+            top_bar = ttk.Frame(top, padding=10)
+            top_bar.pack(fill=X)
+            ttk.Label(top_bar, text="应用:", font=("Helvetica", 11)).pack(side=LEFT, padx=(0, 8))
+
+            all_creds = list_all_credentials()  # [(key, name, port), ...]
+            app_names = [f"{name} (:{port})" if port else f"{name}" for _, name, port in all_creds]
+            key_to_port = {f"{name} (:{port})" if port else f"{name}": (key, port) for key, name, port in all_creds}
+
+            combo = ttk.Combobox(top_bar, values=app_names, state="readonly", width=40)
+            combo.pack(side=LEFT, fill=X, expand=YES)
+            if app_names:
+                combo.current(0)
+
+            # 主体: 显示区
+            body = ttk.Frame(top, padding=15)
+            body.pack(fill=BOTH, expand=YES)
+
+            text = tk.Text(body, wrap="word", font=("Consolas", 10), height=20)
+            text.pack(fill=BOTH, expand=YES)
+
+            def on_select(event=None):
+                sel = combo.get()
+                if not sel:
+                    return
+                key, port = key_to_port[sel]
+                meta = APPS.get(key, {})
+                app_name = meta.get("name", key)
+                display = format_credentials_display(key, app_name, port, nas_ip)
+                text.delete("1.0", tk.END)
+                text.insert("1.0", display)
+
+            combo.bind("<<ComboboxSelected>>", on_select)
+
+            # 默认显示第一个
+            if app_names:
+                on_select()
+
+            # 底部: NAS IP 提示 (用户可改)
+            ttk.Label(top, text=f"⚠️ 凭证基于当前 NAS ({nas_ip}), 修改 IP 后请刷新窗口",
+                      font=("Helvetica", 9), foreground="gray").pack(pady=(0, 10))
+
+        except Exception as e:
+            messagebox.showerror("错误", f"打开凭证查询失败: {type(e).__name__}: {e}")
 
     # -------------------- 顶部栏 (NAS 切换) --------------------
     def _build_top_bar(self):
