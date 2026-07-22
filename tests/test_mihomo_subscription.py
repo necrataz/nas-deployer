@@ -73,6 +73,33 @@ def test_install_apps_streaming_uses_url_when_provided(monkeypatch=None):
     print("✅ test_install_apps_streaming_uses_url_when_provided")
 
 
+def test_app_typing_imports():
+    """v2.0.4.1 regression: app.py 必须 from typing import Optional
+    否则 PyInstaller EXE 第一次跑 _ask_mihomo_subscription 就 NameError 崩"""
+    import ast
+    with open(os.path.join(os.path.dirname(__file__), "..", "src", "app.py")) as f:
+        tree = ast.parse(f.read())
+    # 找所有 import typing 的语句
+    has_typing_optional = False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mods = []
+            if isinstance(node, ast.ImportFrom):
+                mods = [node.module] if node.module else []
+                for alias in node.names:
+                    mods.append(alias.name)
+            else:
+                mods = [alias.name for alias in node.names]
+            if any("typing" in m for m in mods):
+                # 检查是否 import 了 Optional
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name == "Optional":
+                            has_typing_optional = True
+    assert has_typing_optional, "app.py 没 from typing import Optional, EXE 启动必崩"
+    print("✅ test_app_typing_imports — Optional 已 import")
+
+
 if __name__ == "__main__":
     tests = [
         test_build_mihomo_config_basic,
@@ -80,6 +107,7 @@ if __name__ == "__main__":
         test_build_mihomo_config_long_url_truncated,
         test_install_apps_streaming_accepts_mihomo_url,
         test_install_apps_streaming_uses_url_when_provided,
+        test_app_typing_imports,
     ]
     passed = 0
     failed = 0

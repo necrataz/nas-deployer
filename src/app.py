@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, filedialog, simpledialog
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
