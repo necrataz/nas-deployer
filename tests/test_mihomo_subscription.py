@@ -127,6 +127,58 @@ def test_app_dialogs_auto_size():
     print("✅ test_app_dialogs_auto_size — mihomo + credentials 都自适应尺寸")
 
 
+def test_mihomo_bt_block():
+    """v2.0.5: BT 端口全部 REJECT (节点商查 BT 秒封)"""
+    from ssh_client import _build_mihomo_config_from_subscription
+    cfg = _build_mihomo_config_from_subscription("https://test.com/sub")
+    # BT 端口 6881-6889
+    for port in [6881, 6882, 6883, 6884, 6885, 6886, 6887, 6888, 6889]:
+        assert f"DST-PORT,{port},REJECT" in cfg, f"BT port {port} not blocked"
+    assert "DST-PORT,2710,REJECT" in cfg
+    assert "DST-PORT,41413,REJECT" in cfg
+    # tracker 域名
+    for kw in ["tracker", "bittorrent", "torrent", "peer"]:
+        assert f"DOMAIN-KEYWORD,{kw},REJECT" in cfg, f"tracker kw {kw} not blocked"
+    print("✅ test_mihomo_bt_block — 11 BT ports + 4 trackers blocked")
+
+
+def test_mihomo_nas_service_ports_direct():
+    """v2.0.5.1: NAS 服务端口 (含 qB 8080) 全 DIRECT, 不被代理劫持
+    用户报: qB 8080 之前可能被代理劫持烧流量"""
+    from ssh_client import _build_mihomo_config_from_subscription
+    from apps import APPS
+    cfg = _build_mihomo_config_from_subscription("https://test.com/sub")
+    # 所有有 port 的应用都应 DIRECT
+    missing = []
+    for key, meta in APPS.items():
+        port = meta.get("port")
+        if not port or meta.get("hidden"):
+            continue
+        rule = f"DST-PORT,{port},DIRECT,no-resolve"
+        if rule not in cfg:
+            missing.append((key, port))
+    assert not missing, f"missing DIRECT rule for: {missing}"
+    print(f"✅ test_mihomo_nas_service_ports_direct — {sum(1 for m in APPS.values() if m.get('port') and not m.get('hidden'))} services DIRECT")
+
+
+def test_mihomo_lan_direct():
+    """v2.0.5.1: 局域网 (192.168/10/172.16/127.0) 全 DIRECT, 不劫持其他设备"""
+    from ssh_client import _build_mihomo_config_from_subscription
+    cfg = _build_mihomo_config_from_subscription("https://test.com/sub")
+    for cidr in ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "127.0.0.0/8"]:
+        rule = f"IP-CIDR,{cidr},DIRECT"
+        assert rule in cfg, f"missing LAN CIDR: {cidr}"
+    print("✅ test_mihomo_lan_direct — 4 LAN CIDRs DIRECT")
+
+
+def test_mihomo_bind_localhost():
+    """v2.0.5.1: mihomo 只监听 127.0.0.1, 不劫持局域网设备"""
+    from ssh_client import _build_mihomo_config_from_subscription
+    cfg = _build_mihomo_config_from_subscription("https://test.com/sub")
+    assert "bind-address: 127.0.0.1" in cfg, "缺 bind-address: 127.0.0.1"
+    print("✅ test_mihomo_bind_localhost — bind-address = 127.0.0.1")
+
+
 if __name__ == "__main__":
     tests = [
         test_build_mihomo_config_basic,
@@ -136,6 +188,10 @@ if __name__ == "__main__":
         test_install_apps_streaming_uses_url_when_provided,
         test_app_typing_imports,
         test_app_dialogs_auto_size,
+        test_mihomo_bt_block,
+        test_mihomo_nas_service_ports_direct,
+        test_mihomo_lan_direct,
+        test_mihomo_bind_localhost,
     ]
     passed = 0
     failed = 0

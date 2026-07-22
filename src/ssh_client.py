@@ -58,22 +58,38 @@ def _clean_ansi(s: str) -> str:
 
 def _build_mihomo_config_from_subscription(subscription_url: str) -> str:
     """v2.0.4: 根据订阅 URL 生成 mihomo config.yaml
+    v2.0.5: 默认屏蔽 BT (BitTorrent) 流量 — 节点商查 BT 必封号, 不能用代理流量下 BT
+    v2.0.5.1: 端口/服务范围限制 — mihomo 只服务 NAS 自身, 不劫持内网服务
 
     标准 clash-meta 配置:
+    - bind-address: 127.0.0.1 (v2.0.5.1) — mihomo 只监听本机, 不劫持局域网/服务端口
     - proxy-providers 走订阅 URL, health-check 自动测速
     - proxy-groups: URLTest 自动选最快节点 (fallback 用 DIRECT)
-    - rules: GFW 域名 → 代理, 国内直连
+    - rules: 内网 + NAS 服务端口全 DIRECT, BT 屏蔽, 国内直连, 其他走代理
+    - BT 屏蔽规则 (v2.0.5): 标准 trackers + BT 端口直接 REJECT, 不走代理
 
     用户后续可以在 yacd (9091) 里手动调整规则
     """
     # yaml 里 url 不需要引号, 但保险起见用单引号包住
     safe_url = subscription_url.strip().replace("'", "")
-    return f"""# NASDeployer v2.0.4 自动生成 - mihomo 配置
+    return f"""# NASDeployer v2.0.5.1 自动生成 - mihomo 配置
 # 订阅 URL: {safe_url[:60]}{'...' if len(safe_url) > 60 else ''}
 # 控制面板: http://<NAS_IP>:9091/ui (yacd)
+#
+# v2.0.5 设计原则: mihomo 只服务 NAS 自身 (拉镜像 + 解锁 GFW)
+#   - bind-address: 127.0.0.1 (只监听 NAS 本机, 局域网用户直连服务不走代理)
+#   - 局域网 + NAS 服务端口 (8080/5000/5678 等) 全部 DIRECT
+#   - 客户端应该用 127.0.0.1:7890 才会走代理 (NAS 上 docker/curl/wget)
+#
+# v2.0.5 默认屏蔽 BT: 节点商查 BT 流量秒封, 下 BT 必须走 NAS 直连 (qBittorrent)
+#   - BT 端口: 6881-6889 / 2710 / 41413 REJECT
+#   - 标准 trackers REJECT
+#   - 域名关键词: bittorrent, torrent, tracker, peer REJECT
 
 port: 7890
 socks-port: 7891
+# v2.0.5.1: 只监听本机 (NAS 自己用代理, 不劫持局域网设备)
+bind-address: 127.0.0.1
 allow-lan: false
 mode: rule
 log-level: info
@@ -103,10 +119,92 @@ proxy-groups:
     proxies:
       - DIRECT
 
-# 规则: GFW 列表 → 代理, 其他直连
-# (这里用最简单的 GEOIP 兜底, 用户可以在 yacd 改)
+# 规则 (按优先级匹配):
+# 1) BT 端口 + tracker → REJECT (v2.0.5)
+# 2) NAS 服务端口 → DIRECT (v2.0.5.1, 用户访问 qB/moviepilot/xiaoya 等不被代理劫持)
+# 3) 局域网 → DIRECT (v2.0.5.1, 不劫持其他设备)
+# 4) 国内 IP → DIRECT
+# 5) 其他 → 代理
 rules:
+  # ===== v2.0.5 BT 屏蔽 (最高优先级) =====
+  - DST-PORT,6881,REJECT,no-resolve
+  - DST-PORT,6882,REJECT,no-resolve
+  - DST-PORT,6883,REJECT,no-resolve
+  - DST-PORT,6884,REJECT,no-resolve
+  - DST-PORT,6885,REJECT,no-resolve
+  - DST-PORT,6886,REJECT,no-resolve
+  - DST-PORT,6887,REJECT,no-resolve
+  - DST-PORT,6888,REJECT,no-resolve
+  - DST-PORT,6889,REJECT,no-resolve
+  - DST-PORT,2710,REJECT,no-resolve
+  - DST-PORT,41413,REJECT,no-resolve
+  - DOMAIN-KEYWORD,tracker,REJECT
+  - DOMAIN-KEYWORD,bittorrent,REJECT
+  - DOMAIN-KEYWORD,torrent,REJECT
+  - DOMAIN-KEYWORD,peer,REJECT
+  # ===== v2.0.5.1 NAS 服务端口全 DIRECT (不被代理劫持) =====
+  # qBittorrent (WebUI)
+  - DST-PORT,8080,DIRECT,no-resolve
+  # MoviePilot
+  - DST-PORT,5000,DIRECT,no-resolve
+  # xiaoya Alist
+  - DST-PORT,5678,DIRECT,no-resolve
+  # LibreTV
+  - DST-PORT,8081,DIRECT,no-resolve
+  # Excalidraw
+  - DST-PORT,5001,DIRECT,no-resolve
+  # Dashy
+  - DST-PORT,8082,DIRECT,no-resolve
+  # Calibre-Web
+  - DST-PORT,8083,DIRECT,no-resolve
+  # Stirling PDF
+  - DST-PORT,8084,DIRECT,no-resolve
+  # Photopea
+  - DST-PORT,8085,DIRECT,no-resolve
+  # FreshRSS
+  - DST-PORT,8086,DIRECT,no-resolve
+  # OnlyOffice
+  - DST-PORT,8087,DIRECT,no-resolve
+  # m3u Manager
+  - DST-PORT,8088,DIRECT,no-resolve
+  # edge-tts
+  - DST-PORT,8089,DIRECT,no-resolve
+  # BiliBiliTool
+  - DST-PORT,8090,DIRECT,no-resolve
+  # yt-dlp
+  - DST-PORT,8091,DIRECT,no-resolve
+  # insdown
+  - DST-PORT,8888,DIRECT,no-resolve
+  # Lucky
+  - DST-PORT,16601,DIRECT,no-resolve
+  # SiYuan
+  - DST-PORT,6806,DIRECT,no-resolve
+  # Navidrome
+  - DST-PORT,4533,DIRECT,no-resolve
+  # MiMusic
+  - DST-PORT,8181,DIRECT,no-resolve
+  # IYUU
+  - DST-PORT,8787,DIRECT,no-resolve
+  # Audiobookshelf
+  - DST-PORT,13378,DIRECT,no-resolve
+  # HivisionIDPhotos
+  - DST-PORT,7860,DIRECT,no-resolve
+  # RSSHub
+  - DST-PORT,1200,DIRECT,no-resolve
+  # PanSearch
+  - DST-PORT,5522,DIRECT,no-resolve
+  # Immich
+  - DST-PORT,2283,DIRECT,no-resolve
+  # mihomo (yacd 控制面板)
+  - DST-PORT,9091,DIRECT,no-resolve
+  # ===== v2.0.5.1 局域网全 DIRECT (不劫持其他设备, 即使 bind-address 失效也兜底) =====
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  # ===== 国内 IP 直连 =====
   - GEOIP,CN,DIRECT
+  # ===== 其他走代理 (NAS 自己拉镜像 + 解锁 GFW 用) =====
   - MATCH,AUTO
 """
 
@@ -829,6 +927,56 @@ EOF'"""
         stop_cmd = f"cd {remote_dir} && docker compose {profiles_str} stop"
         exit_code, output = self._docker_cmd(stop_cmd, timeout=300)
         return exit_code == 0, output
+
+    def uninstall_apps(self, selected_apps: List[str], compose_content: str, remove_volumes: bool = False) -> Tuple[bool, str]:
+        """v2.0.5: 卸载应用 — 删容器 + (可选) 删卷 + 删镜像
+
+        用 docker compose rm -sf -v 单 service, 比 down 更精细:
+        - rm -sf: 强制删容器 + 不删依赖 (不会连别的 service 一起带走)
+        - -v: 删匿名卷 (用户配置 ./configs/xxx 不会被卷走, 因为是 bind mount)
+        - remove_volumes=False: 保留用户配置 (configs/book/photos 这种)
+        - remove_volumes=True: 连 ./configs 一起 rm -rf (危险, 显式开关)
+
+        Args:
+            selected_apps: ['qbittorrent', 'moviepilot']
+            compose_content: docker-compose.yml 字符串 (要重新上传)
+            remove_volumes: True = 删数据, False = 只删容器 (默认)
+
+        Returns:
+            (ok, "已卸载 2 个服务, 保留数据卷" | "err msg")
+        """
+        if not self.is_connected():
+            return False, "未连接"
+
+        from apps import APPS
+        valid_apps = [a for a in selected_apps if a in APPS]
+        if not valid_apps:
+            return False, "没有有效的应用"
+
+        remote_dir = "/tmp/nas_deploy"
+        remote_compose = f"{remote_dir}/docker-compose.yml"
+        ok, msg = self.upload_content(compose_content, remote_compose)
+        if not ok:
+            return False, msg
+
+        succeeded = []
+        failed = []
+        for app_key in valid_apps:
+            # v1.8: 单 service 卸载, 不影响其他
+            vflag = "-v" if remove_volumes else ""
+            rm_cmd = f"cd {remote_dir} && docker compose rm {vflag} -sf {app_key}"
+            exit_code, output = self._docker_cmd(rm_cmd, timeout=120)
+            if exit_code == 0:
+                succeeded.append(app_key)
+            else:
+                failed.append((app_key, output))
+
+        if failed:
+            fail_msg = "; ".join(f"{a}: {o[:80]}" for a, o in failed)
+            return False, f"卸载 {len(succeeded)} 个成功, {len(failed)} 个失败\n{fail_msg}"
+
+        vol_msg = "数据卷已清理" if remove_volumes else "数据卷已保留 (configs/book/photos)"
+        return True, f"已卸载 {len(succeeded)} 个服务 ({', '.join(succeeded)}), {vol_msg}"
 
     def restart_apps(self, selected_apps: List[str], compose_content: str) -> Tuple[bool, str]:
         """重启选中的应用"""
