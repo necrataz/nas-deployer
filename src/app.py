@@ -1,6 +1,6 @@
 # ==============================================================================
-# NAS Deployer v2.0.6 - 主 GUI (ttkbootstrap)
-# 新增: 首页 VPN 一键安装卡片 + mihomo yaml BT 端口扩到 49152-65535 + DNS 优化
+# NAS Deployer v2.0.7 - 主 GUI (ttkbootstrap)
+# 新增: VPN 卡片启停开关 (启动/停止按钮按状态切换) + 自动跳过已装容器
 # ==============================================================================
 
 import os
@@ -256,7 +256,7 @@ class NASDeployerApp:
         tab = ttk.Frame(self.notebook, padding=20)
         self.notebook.add(tab, text="📡 连接")
 
-        # v2.0.6: VPN 一键安装卡片 (红色醒目, 顶部位置)
+        # v2.0.7: VPN 一键安装卡片 (红色醒目, 顶部位置) + 启停开关
         vpn_frame = ttk.LabelFrame(tab, text="🛡 网络代理 (VPN)", padding=15)
         vpn_frame.grid(row=0, column=0, columnspan=4, sticky=EW, pady=(0, 15))
 
@@ -278,13 +278,37 @@ class NASDeployerApp:
             justify=LEFT,
         ).grid(row=1, column=0, sticky=W, padx=5, pady=(0, 8))
 
-        ttk.Button(
+        # v2.0.7: 状态行 (未装 / 已装 / 运行中 / 已停止) — 实时刷新
+        self.vpn_status_label = ttk.Label(
             vpn_frame,
-            text="🚀 一键安装并配置 VPN",
+            text="状态: 检测中...",
+            font=("Helvetica", 9, "bold"),
+            foreground="#7f8c8d",
+        )
+        self.vpn_status_label.grid(row=2, column=0, sticky=W, padx=5, pady=(0, 8))
+
+        # v2.0.7: 两个按钮并排 — 启动 + 停止 (按状态 enabled/disabled)
+        btn_frame = ttk.Frame(vpn_frame)
+        btn_frame.grid(row=3, column=0, sticky=W, padx=5)
+
+        self.vpn_start_btn = ttk.Button(
+            btn_frame,
+            text="🚀 一键安装并启动",
             command=self._quick_install_vpn,
             bootstyle="danger",
-            width=30,
-        ).grid(row=2, column=0, sticky=W, padx=5)
+            width=20,
+        )
+        self.vpn_start_btn.pack(side=LEFT, padx=(0, 5))
+
+        self.vpn_stop_btn = ttk.Button(
+            btn_frame,
+            text="⏹ 停止 VPN",
+            command=self._stop_vpn,
+            bootstyle="secondary",
+            width=15,
+            state=DISABLED,  # v2.0.7: 默认禁用, _refresh_vpn_status 启用
+        )
+        self.vpn_stop_btn.pack(side=LEFT)
 
         # 当前 NAS 信息 (只读)
         info_frame = ttk.LabelFrame(tab, text="当前 NAS 信息", padding=15)
@@ -844,7 +868,9 @@ class NASDeployerApp:
         ).start()
 
     def _install_vpn_thread(self, mihomo_sub):
-        """v2.0.6: 后台线程 — 装 mihomo + 写 daemon.json + 跑诊断"""
+        """v2.0.6: 后台线程 — 装 mihomo + 写 daemon.json + 跑诊断
+        v2.0.7: 装完后调 _refresh_vpn_status 切换按钮状态
+        """
         progress = ProgressWindow(self.root, title="VPN 安装进度 (实时日志)")
         try:
             ok, msg = self.connection.install_apps_streaming(
@@ -858,6 +884,81 @@ class NASDeployerApp:
             progress.finish(ok, msg if ok else f"❌ {msg}")
         except Exception as e:
             progress.finish(False, f"异常: {e}")
+        finally:
+            # v2.0.7: 装完/失败都刷状态 (失败时 status = 已装但未运行)
+            self.root.after(1000, self._refresh_vpn_status)
+
+    # -------------------- v2.0.7: VPN 启停开关 --------------------
+    def _stop_vpn(self):
+        """v2.0.7: 停止 mihomo 容器 (不删, 只 stop)"""
+        if not self.connection.is_connected():
+            messagebox.showerror("错误", "请先连接 NAS")
+            return
+        if not messagebox.askyesno("确认", "停止 mihomo 代理? (容器不删, 可重新启动)"):
+            return
+        self._log("=== 停止 VPN ===")
+        threading.Thread(target=self._stop_vpn_thread, daemon=True).start()
+
+    def _stop_vpn_thread(self):
+        """v2.0.7: 后台停 mihomo"""
+        progress = ProgressWindow(self.root, title="VPN 停止进度")
+        try:
+            ok, msg = self.connection.stop_apps(
+                ["mihomo"], DOCKER_COMPOSE_YML
+            )
+            progress.finish(ok, msg if ok else f"❌ {msg}")
+        except Exception as e:
+            progress.finish(False, f"异常: {e}")
+        finally:
+            self.root.after(500, self._refresh_vpn_status)
+
+    def _refresh_vpn_status(self):
+        """v2.0.7: 刷新 VPN 状态行 + 切换按钮 enabled
+        - 未装: 状态=未安装, 启动按钮 enabled, 停止按钮 disabled
+        - 已装未运行: 状态=已停止, 启动按钮 enabled (点击会装), 停止按钮 disabled
+        - 已装运行中: 状态=运行中, 启动按钮 disabled, 停止按钮 enabled
+        """
+        if not self.connection.is_connected():
+            self.vpn_status_label.config(text="状态: 未连接", foreground="gray")
+            self.vpn_start_btn.config(state=DISABLED)
+            self.vpn_stop_btn.config(state=DISABLED)
+            return
+
+        # 查 mihomo 容器状态
+        ec, out = self.connection.run_command(
+            "docker ps -a --filter name=mihomo --format '{{.Names}}|{{.Status}}'",
+            sudo=True, timeout=5,
+        )
+        if ec != 0 or not out.strip():
+            # 未装
+            self.vpn_status_label.config(text="状态: ⚪ 未安装", foreground="gray")
+            self.vpn_start_btn.config(state=NORMAL)
+            self.vpn_stop_btn.config(state=DISABLED)
+            return
+
+        line = out.strip().splitlines()[0]
+        parts = line.split("|")
+        if len(parts) < 2 or parts[0] != "mihomo":
+            self.vpn_status_label.config(text="状态: ⚪ 未安装", foreground="gray")
+            self.vpn_start_btn.config(state=NORMAL)
+            self.vpn_stop_btn.config(state=DISABLED)
+            return
+
+        status = parts[1]
+        if status.startswith("Up"):
+            # 已装运行中
+            self.vpn_status_label.config(
+                text=f"状态: 🟢 运行中 ({status})", foreground="#27ae60"
+            )
+            self.vpn_start_btn.config(state=DISABLED)
+            self.vpn_stop_btn.config(state=NORMAL)
+        else:
+            # 已装未运行 (Exited / Restarting / etc)
+            self.vpn_status_label.config(
+                text=f"状态: 🟡 已停止 ({status})", foreground="#f39c12"
+            )
+            self.vpn_start_btn.config(state=NORMAL)
+            self.vpn_stop_btn.config(state=DISABLED)
 
     # -------------------- 安装/停止/重启/拉取 (用进度窗口) --------------------
     def _install_selected(self):

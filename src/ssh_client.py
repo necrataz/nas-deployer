@@ -1,6 +1,7 @@
 # ==============================================================================
-# NAS Deployer v2.0.6 - SSH + Docker 编排
+# NAS Deployer v2.0.7 - SSH + Docker 编排
 # v2.0.6: mihomo 从 APPS/net profile 移除, 改走首页 VPN 一键安装卡片
+# v2.0.7: install_apps_streaming 自动跳过已装容器 (不重 pull)
 # v1.7 新增:
 #   1. run_command_streaming 新增 on_progress / progress_min / progress_max 参数
 #   2. 解析 docker compose v2 输出 "Pulling X/Y" / "Downloading X MB / Y MB"
@@ -738,9 +739,54 @@ class NASConnection:
         if not services_to_pull:
             return False, "没有需要拉取的应用"
 
+        # v2.0.7: 自动跳过已装的 service (容器已存在就跳过 pull, 不浪费时间重拉)
+        # 一次拿所有容器名, 避免每个 svc 都跑一遍 docker ps
+        ec, ps_out = self.run_command(
+            "docker ps -a --format '{{.Names}}'",
+            sudo=True, timeout=10,
+        )
+        existing = set()
+        if ec == 0 and ps_out:
+            for ln in ps_out.strip().splitlines():
+                ln = ln.strip()
+                if ln:
+                    existing.add(ln)
+
+        to_skip_install = []  # 已装且 up 的 service (pull 后会 up -d)
+        to_actually_pull = []  # 真要拉的
+        for svc in services_to_pull:
+            if svc in existing:
+                # 容器已存在 — 检查是否在跑
+                ec2, st_out = self.run_command(
+                    f"docker inspect -f '{{{{.State.Running}}}}' {svc}",
+                    sudo=True, timeout=5,
+                )
+                running = (ec2 == 0 and st_out.strip() == "true")
+                if running:
+                    on_line(f"⏭ {svc} 已在运行, 跳过 pull")
+                    to_skip_install.append(svc)
+                else:
+                    on_line(f"⏭ {svc} 已存在但未运行, 跳过 pull (会直接 up)")
+                    to_skip_install.append(svc)
+            else:
+                to_actually_pull.append(svc)
+
+        services_to_pull = to_actually_pull
+        if not services_to_pull and not to_skip_install:
+            return False, "没有需要拉取的应用"
+        if not services_to_pull:
+            # 全部已装
+            on_line(f"✅ 所有 {len(to_skip_install)} 个应用都已安装")
+            # 走 up 流程确保都启动
+            succeeded = to_skip_install
+            skipped = []
+            # 直接进 up 阶段 — fall through 走后续逻辑
+
         # 3. 逐个 service 拉取 (v1.8)
+        # v2.0.7: 保留之前 to_skip_install 里"已装"的到 succeeded
+        # (让 up -d 阶段也覆盖它们, 确保 up 后 running)
         skipped = []   # 拉失败/取消的
-        succeeded = []  # 拉成功的
+        succeeded = list(to_skip_install)  # 已装的也算"成功"
         total = len(services_to_pull)
         for idx, svc in enumerate(services_to_pull):
             if is_cancelled and is_cancelled():

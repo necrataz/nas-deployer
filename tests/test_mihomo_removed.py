@@ -134,3 +134,53 @@ def test_uninstall_panel_host_mode_display():
     assert "无端口" in src, (
         "v2.0.6: 未知服务仍应显示 (无端口)"
     )
+
+
+# ==================== v2.0.7 新增测试 ====================
+
+def test_vpn_stop_method_exists():
+    """v2.0.7: app.py 必须有 _stop_vpn + _stop_vpn_thread + _refresh_vpn_status"""
+    import ast
+    from pathlib import Path
+    src_path = Path(__file__).parent.parent / "src" / "app.py"
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
+    method_names = [
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    for m in ("_stop_vpn", "_stop_vpn_thread", "_refresh_vpn_status"):
+        assert m in method_names, (
+            f"v2.0.7: app.py 必须有 {m} 方法 (VPN 启停开关)"
+        )
+
+
+def test_vpn_status_label_exists():
+    """v2.0.7: VPN 卡片必须有 vpn_status_label + vpn_start_btn + vpn_stop_btn"""
+    src_path = Path(__file__).parent.parent / "src" / "app.py"
+    content = src_path.read_text(encoding="utf-8")
+    for attr in ("vpn_status_label", "vpn_start_btn", "vpn_stop_btn"):
+        assert f"self.{attr}" in content, (
+            f"v2.0.7: VPN 卡片必须 self.{attr}"
+        )
+
+
+def test_skip_installed_logic_exists():
+    """v2.0.7: install_apps_streaming 必须有 '跳过已装' 逻辑"""
+    # inspect.getsource 不能正确处理类方法的 indentation, 改用原始文本搜索
+    from pathlib import Path
+    src_path = Path(__file__).parent.parent / "src" / "ssh_client.py"
+    src = src_path.read_text(encoding="utf-8")
+    # 必须有 to_skip_install / to_actually_pull 变量
+    assert "to_skip_install" in src, (
+        "v2.0.7: install_apps_streaming 必须有 to_skip_install 变量 "
+        "(跳过已装容器)"
+    )
+    assert "to_actually_pull" in src, (
+        "v2.0.7: 必须有 to_actually_pull 变量 (要实际拉的)"
+    )
+    assert "docker ps -a --format" in src, (
+        "v2.0.7: 必须用 docker ps -a 查已存在容器"
+    )
+    assert "已在运行" in src, (
+        "v2.0.7: 跳过时必须给用户提示 '已在运行'"
+    )
