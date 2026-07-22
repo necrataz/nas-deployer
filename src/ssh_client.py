@@ -1,5 +1,6 @@
 # ==============================================================================
 # NAS Deployer v2.0.6 - SSH + Docker 编排
+# v2.0.6: mihomo 从 APPS/net profile 移除, 改走首页 VPN 一键安装卡片
 # v1.7 新增:
 #   1. run_command_streaming 新增 on_progress / progress_min / progress_max 参数
 #   2. 解析 docker compose v2 输出 "Pulling X/Y" / "Downloading X MB / Y MB"

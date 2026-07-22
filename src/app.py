@@ -871,14 +871,8 @@ class NASDeployerApp:
 
         mem_mb = total_memory_mb(selected)
 
-        # v2.0.4: 如果包含 mihomo, 弹窗收集订阅 URL
-        mihomo_sub = None
-        if "mihomo" in selected:
-            mihomo_sub = self._ask_mihomo_subscription()
-            if mihomo_sub is None:
-                return  # 用户取消
-            elif mihomo_sub == "":  # 选了"暂不填"
-                mihomo_sub = None
+        # v2.0.6: mihomo 已从 APPS 移除, 弹订阅逻辑只在 _quick_install_vpn 里
+        # (用户在首页 VPN 卡片触发, 不会走到这里)
 
         if not messagebox.askyesno(
             "确认",
@@ -887,7 +881,8 @@ class NASDeployerApp:
             return
 
         self._log(f"=== 开始安装: {', '.join(selected)} ===")
-        threading.Thread(target=self._install_thread, args=(selected, mihomo_sub), daemon=True).start()
+        # v2.0.6: mihomo_sub 固定 None (mihomo 不在 APPS 里, 用户走不到这里)
+        threading.Thread(target=self._install_thread, args=(selected, None), daemon=True).start()
 
     def _ask_mihomo_subscription(self) -> Optional[str]:
         """v2.0.4: 弹窗输入 mihomo 订阅 URL
