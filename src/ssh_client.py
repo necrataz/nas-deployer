@@ -1,7 +1,8 @@
 # ==============================================================================
-# NAS Deployer v2.0.7 - SSH + Docker 编排
-# v2.0.6: mihomo 从 APPS/net profile 移除, 改走首页 VPN 一键安装卡片
+# NAS Deployer v2.0.7.1 - SSH + Docker 编排
 # v2.0.7: install_apps_streaming 自动跳过已装容器 (不重 pull)
+# v2.0.7.1: daemon.json 加 registry-mirrors (3 个国内镜像) + 重启 docker + 验证生效
+#   用户报: 13 个 skipped 全是 docker.io, 实际 root cause = docker daemon 没重启 + 没配 mirror
 # v1.7 新增:
 #   1. run_command_streaming 新增 on_progress / progress_min / progress_max 参数
 #   2. 解析 docker compose v2 输出 "Pulling X/Y" / "Downloading X MB / Y MB"
@@ -15,6 +16,7 @@
 # ==============================================================================
 
 import paramiko
+import time
 from scp import SCPClient
 from typing import Tuple, Optional, List, Dict
 import io
@@ -957,31 +959,77 @@ rules:
             for line in diag.splitlines():
                 on_line(line)
 
-        # v2.0.2: 如果装了 mihomo, 自动写 ~/.docker/config.json 让后续 docker pull 走代理
+        # v2.0.2: 装了 mihomo, 自动写 daemon.json — 三件套:
+        #   1) registry-mirrors 国内镜像加速器 (memory 验证活的 3 个, docker 直连)
+        #   2) proxies.default.httpProxy 走 mihomo (兜底, mirror 命中不了的)
+        #   3) 重启 docker daemon 让配置生效 (不重启 = 假绿, docker 还是直连)
         if "mihomo" in succeeded_pull:
             try:
-                on_line("\n=== 配置 docker daemon 走 mihomo 代理 ===")
-                proxy_cmd = """bash -c 'mkdir -p ~/.docker && cat > ~/.docker/config.json <<EOF
-{
-  "proxies": {
-    "default": {
-      "httpProxy": "http://127.0.0.1:7890",
-      "httpsProxy": "http://127.0.0.1:7890",
-      "noProxy": "localhost,127.0.0.1,<NAS_IP>"
-    }
-  }
-}
-EOF'"""
-                # <NAS_IP> 替换占位
+                on_line("\n=== 配置 docker daemon (mirror + proxy) ===")
                 from host_utils import clean_host as _ch
                 nas_ip = _ch(self.host or "") if self.host else ""
-                proxy_cmd = proxy_cmd.replace("<NAS_IP>", nas_ip)
+
+                # v2.0.7.1: 三件套 daemon.json
+                # - registry-mirrors: 国内镜像加速器 (docker daemon 直连, 不走 mihomo)
+                # - proxies: 兜底走 mihomo (镜像加速器没命中的再去代理)
+                # - noProxy: NAS 自己 + 局域网 + 已知 mirror 域名 (避免无谓绕路)
+                mirror_list = ",\n    ".join([
+                    '"https://docker.m.daocloud.io"',
+                    '"https://docker.1ms.run"',
+                    '"https://docker.fnnas.com"',
+                ])
+                proxy_cmd = f"""bash -c 'mkdir -p ~/.docker && cat > ~/.docker/config.json <<EOF
+{{
+  "registry-mirrors": [
+    {mirror_list}
+  ],
+  "proxies": {{
+    "default": {{
+      "httpProxy": "http://127.0.0.1:7890",
+      "httpsProxy": "http://127.0.0.1:7890",
+      "noProxy": "localhost,127.0.0.1,{nas_ip},192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+    }}
+  }}
+}}
+EOF'"""
                 ec, out = self.run_command(proxy_cmd, sudo=False)
-                on_line(f"docker proxy 配置: exit={ec}")
-                if ec == 0:
-                    msg += " | docker 已走 mihomo 代理 (端口 7890)"
+                on_line(f"daemon.json 写入: exit={ec}")
+                if ec != 0:
+                    on_line(f"[WARN] daemon.json 写入失败: {out[:200]}")
+                else:
+                    # v2.0.7.1: 重启 docker daemon 让配置生效
+                    on_line("=== 重启 docker daemon 让配置生效 ===")
+                    ec2, out2 = self.run_command(
+                        "sudo systemctl restart docker",
+                        sudo=True, timeout=60,
+                    )
+                    on_line(f"systemctl restart docker: exit={ec2}")
+                    if ec2 != 0:
+                        on_line(f"[WARN] 重启失败: {out2[:200]}")
+                        on_line("尝试 sudo /etc/init.d/docker restart ...")
+                        ec3, out3 = self.run_command(
+                            "sudo /etc/init.d/docker restart 2>&1 || true",
+                            sudo=True, timeout=30,
+                        )
+                        on_line(f"/etc/init.d/docker restart: exit={ec3}")
+
+                    # v2.0.7.1: 验证 mirror 真的生效 (不验证 = 假绿)
+                    on_line("=== 验证 daemon 配置生效 ===")
+                    time.sleep(2)  # 等 docker daemon 完全启动
+                    ec_v, out_v = self.run_command(
+                        "sudo docker info 2>/dev/null | grep -A 10 'Registry Mirrors'",
+                        sudo=True, timeout=10,
+                    )
+                    if out_v.strip():
+                        on_line("✅ Registry Mirrors:")
+                        for ln in out_v.strip().splitlines()[:6]:
+                            on_line(f"  {ln}")
+                    else:
+                        on_line("[WARN] 看不到 Registry Mirrors, daemon 可能没完全启动")
+
+                    msg += " | daemon 已配 mirror+proxy, 已重启"
             except Exception as e:
-                on_line(f"[WARN] docker proxy 配置失败: {e}")
+                on_line(f"[WARN] daemon.json 配置失败: {e}")
 
         # v1.8: 即便有 skipped 也返回 True (用户拿到的是「能用的部分」)
         return True, msg

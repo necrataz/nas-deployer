@@ -184,3 +184,44 @@ def test_skip_installed_logic_exists():
     assert "已在运行" in src, (
         "v2.0.7: 跳过时必须给用户提示 '已在运行'"
     )
+
+
+# ==================== v2.0.7.1 新增测试 ====================
+
+def test_daemon_json_has_registry_mirrors():
+    """v2.0.7.1: 写 daemon.json 时必须包含 registry-mirrors (3 个国内镜像)"""
+    from pathlib import Path
+    src = (Path(__file__).parent.parent / "src" / "ssh_client.py").read_text(encoding="utf-8")
+    # 必须有 3 个 mirror
+    for mirror in ("docker.m.daocloud.io", "docker.1ms.run", "docker.fnnas.com"):
+        assert mirror in src, (
+            f"v2.0.7.1: daemon.json 必须包含 {mirror} (国内镜像加速器)"
+        )
+    assert "registry-mirrors" in src, (
+        "v2.0.7.1: 必须有 registry-mirrors 字段 (不是只配 proxies)"
+    )
+
+
+def test_daemon_restart_after_config():
+    """v2.0.7.1: 写 daemon.json 后必须重启 docker daemon (不重启 = 假绿)"""
+    from pathlib import Path
+    src = (Path(__file__).parent.parent / "src" / "ssh_client.py").read_text(encoding="utf-8")
+    assert "systemctl restart docker" in src, (
+        "v2.0.7.1: 必须 systemctl restart docker 让配置生效"
+    )
+    # 还必须有 fallback (fnOS 可能用 init.d)
+    assert "/etc/init.d/docker" in src, (
+        "v2.0.7.1: 必须有 /etc/init.d/docker restart fallback (兼容 init.d 系统)"
+    )
+
+
+def test_daemon_verify_after_restart():
+    """v2.0.7.1: 重启 daemon 后必须 docker info 验证 mirror 生效"""
+    from pathlib import Path
+    src = (Path(__file__).parent.parent / "src" / "ssh_client.py").read_text(encoding="utf-8")
+    assert "Registry Mirrors" in src, (
+        "v2.0.7.1: 必须 docker info 验证 Registry Mirrors 生效"
+    )
+    assert "sudo docker info" in src, (
+        "v2.0.7.1: 验证步骤必须有 sudo (普通用户看不到 daemon 配置)"
+    )
