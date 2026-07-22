@@ -82,3 +82,55 @@ def test_quick_install_vpn_method_exists():
     assert "_quick_install_vpn" in method_names, (
         "v2.0.6: app.py 必须有 _quick_install_vpn 一键方法"
     )
+
+
+def test_uninstall_accepts_mihomo():
+    """v2.0.6 回归: 卸载不能因 mihomo 不在 APPS 而拒绝
+    (用户报: '卸载识别不到mihomo, 显示没有有效的应用')
+    """
+    import inspect
+    from ssh_client import NASConnection
+    src = inspect.getsource(NASConnection.uninstall_apps)
+    # 不应再过滤 APPS dict
+    assert "if a in APPS" not in src, (
+        "v2.0.6: uninstall_apps 不应再用 'if a in APPS' 过滤, "
+        "(mihomo 已从 APPS 移除, 但卸载仍要能用)"
+    )
+
+
+def test_uninstall_panel_guess_host_mode():
+    """v2.0.6 回归: host 网络模式容器显示端口提示而不是 '(无端口)'
+    (用户报: 'mihomo为什么显示无端口')
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+    # 不直接实例化 UninstallPanel (需要 tkinter parent), 用类方法静态分析
+    import inspect
+    from uninstall_panel import UninstallPanel
+    assert hasattr(UninstallPanel, "_guess_network_mode"), (
+        "v2.0.6: UninstallPanel 必须有 _guess_network_mode 方法"
+    )
+    # 方法签名
+    sig = inspect.signature(UninstallPanel._guess_network_mode)
+    assert "container_name" in sig.parameters
+
+
+def test_uninstall_panel_host_mode_display():
+    """v2.0.6: _guess_network_mode('mihomo') 应返回 host 模式提示"""
+    # 不实例化 panel (会触发 ttkbootstrap 初始化, CI 无 display 会挂)
+    # 改用 inspect 提取方法逻辑, 直接验证 HOST_MODE_SERVICES 字典内容
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+    import inspect
+    from uninstall_panel import UninstallPanel
+
+    src = inspect.getsource(UninstallPanel._guess_network_mode)
+    assert "mihomo" in src and "7890" in src, (
+        "v2.0.6: _guess_network_mode 应 hardcode mihomo 端口提示"
+    )
+    assert "无端口" in src, (
+        "v2.0.6: 未知服务仍应显示 (无端口)"
+    )

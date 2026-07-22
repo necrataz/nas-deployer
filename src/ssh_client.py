@@ -1039,8 +1039,10 @@ EOF'"""
         if not self.is_connected():
             return False, "未连接"
 
-        from apps import APPS
-        valid_apps = [a for a in selected_apps if a in APPS]
+        # v2.0.6: 不再过滤 APPS dict (mihomo 已从 APPS 移除, 但卸载仍要能用)
+        # 信任 selected_apps 直接当 docker service 名传给 docker compose rm
+        # (跟 install_apps_streaming 一致)
+        valid_apps = list(selected_apps)
         if not valid_apps:
             return False, "没有有效的应用"
 

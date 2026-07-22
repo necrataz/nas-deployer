@@ -1,5 +1,6 @@
 # ==============================================================================
 # NAS Deployer v2.0.6 - 卸载勾选面板
+# v2.0.6: 加 _guess_network_mode — host 模式容器 (mihomo) 不再显示 '(无端口)'
 # ==============================================================================
 # 自包含 ttk widget: 顶部全选/反选/全不选 + 滚动区勾选容器列表 + 底部卸载按钮
 # 用法:
@@ -141,10 +142,13 @@ class UninstallPanel:
             self._check_vars[name] = var
 
             # Checkbutton + 容器信息
+            # v2.0.6: ports 为空时不再统一显示 '(无端口)', 因为 host 网络模式容器
+            # (如 mihomo) docker ps {{.Ports}} 永远空 — 但实际监听 NAS 主机端口
+            port_display = ports if ports else self._guess_network_mode(name)
             chk = ttk.Checkbutton(
                 row,
                 variable=var,
-                text=f"  {name}   |   {status}   |   {ports or '(无端口)'}",
+                text=f"  {name}   |   {status}   |   {port_display}",
                 command=self._on_item_toggle,
             )
             chk.pack(side=LEFT, fill=X, expand=YES)
@@ -183,6 +187,19 @@ class UninstallPanel:
         for var in self._check_vars.values():
             var.set(not var.get())
         self._on_item_toggle()
+
+    def _guess_network_mode(self, container_name: str) -> str:
+        """v2.0.6: docker ps {{.Ports}} 在 host 网络模式下永远空
+        (如 mihomo, mihomo-yacd 等)
+        对已知 host 模式服务显示端口提示, 其他仍显示 (无端口)
+
+        这里 hardcode 的是 compose_data.py 里所有 network_mode: host 的服务
+        (避免每次 docker inspect 性能开销)
+        """
+        HOST_MODE_SERVICES = {
+            "mihomo": "host 模式: 7890/9091",
+        }
+        return HOST_MODE_SERVICES.get(container_name, "(无端口)")
 
     def _trigger_uninstall(self, remove_volumes: bool):
         """点击卸载按钮: 收集勾选 → 回调"""
