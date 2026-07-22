@@ -56,6 +56,61 @@ def _clean_ansi(s: str) -> str:
     return s.strip()
 
 
+def _build_mihomo_config_from_subscription(subscription_url: str) -> str:
+    """v2.0.4: 根据订阅 URL 生成 mihomo config.yaml
+
+    标准 clash-meta 配置:
+    - proxy-providers 走订阅 URL, health-check 自动测速
+    - proxy-groups: URLTest 自动选最快节点 (fallback 用 DIRECT)
+    - rules: GFW 域名 → 代理, 国内直连
+
+    用户后续可以在 yacd (9091) 里手动调整规则
+    """
+    # yaml 里 url 不需要引号, 但保险起见用单引号包住
+    safe_url = subscription_url.strip().replace("'", "")
+    return f"""# NASDeployer v2.0.4 自动生成 - mihomo 配置
+# 订阅 URL: {safe_url[:60]}{'...' if len(safe_url) > 60 else ''}
+# 控制面板: http://<NAS_IP>:9091/ui (yacd)
+
+port: 7890
+socks-port: 7891
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 0.0.0.0:9091
+secret: ""
+
+# 节点从订阅拉 (yaml/clash 支持的格式)
+proxy-providers:
+  subscription:
+    type: http
+    url: '{safe_url}'
+    interval: 3600
+    health-check:
+      enable: true
+      url: 'http://www.gstatic.com/generate_204'
+      interval: 300
+
+# 自动选最快的节点 (fallback DIRECT 防断网)
+proxy-groups:
+  - name: "AUTO"
+    type: url-test
+    url: 'http://www.gstatic.com/generate_204'
+    interval: 300
+    tolerance: 50
+    use:
+      - subscription
+    proxies:
+      - DIRECT
+
+# 规则: GFW 列表 → 代理, 其他直连
+# (这里用最简单的 GEOIP 兜底, 用户可以在 yacd 改)
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,AUTO
+"""
+
+
 class NASConnection:
     """管理到 NAS 的 SSH 连接和 Docker 命令执行"""
 
@@ -548,6 +603,7 @@ class NASConnection:
         on_progress,
         is_cancelled=None,
         profile_overrides: Optional[List[str]] = None,
+        mihomo_subscription_url: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """流式版 install_apps, 用于 v1.1+ 进度窗口实时日志
 
@@ -577,13 +633,18 @@ class NASConnection:
         if not ok:
             return False, f"上传 compose 失败: {msg}"
 
-        # v2.0.2: 如果包含 mihomo, 先写个最小 config.yaml (没订阅不会真启动, 但容器能起来)
-        # 用户的订阅后续 SSH 上去改
+        # v2.0.2/v2.0.4: 如果包含 mihomo, 写 mihomo config.yaml
+        # v2.0.4: 如果传了 mihomo_subscription_url, 用真订阅配置 (含 proxy-providers + URLTest 组)
+        # 否则写占位 config (容器能起来, 但无代理节点)
         if "mihomo" in selected_apps:
             try:
-                on_line("=== 写入 mihomo 默认配置 (请填订阅 URL 替换) ===")
-                # minimal config — 米家下载/解析器全留空, 但 mihomo 不会 crash
-                mihomo_cfg = """port: 7890
+                if mihomo_subscription_url:
+                    on_line("=== 用订阅 URL 写入 mihomo 配置 ===")
+                    mihomo_cfg = _build_mihomo_config_from_subscription(mihomo_subscription_url)
+                    on_line(f"订阅 URL: {mihomo_subscription_url[:60]}...")
+                else:
+                    on_line("=== 写入 mihomo 默认配置 (无订阅) ===")
+                    mihomo_cfg = """port: 7890
 socks-port: 7891
 allow-lan: false
 mode: rule
@@ -594,11 +655,11 @@ proxy-providers: {}
 rules:
   - MATCH,DIRECT
 """
-                ec, out = self.run_command(
-                    f"mkdir -p {remote_dir}/configs/mihomo && cat > {remote_dir}/configs/mihomo/config.yaml <<'MCMOEOF'\n{mihomo_cfg}MCMOEOF",
-                    sudo=False,
-                )
-                on_line(f"mihomo config 写入: exit={ec}")
+                # 上传配置 (用 upload_content 避免 heredoc 转义坑)
+                remote_cfg = f"{remote_dir}/configs/mihomo/config.yaml"
+                self.run_command(f"mkdir -p {remote_dir}/configs/mihomo", sudo=False)
+                ok_cfg, msg_cfg = self.upload_content(mihomo_cfg, remote_cfg)
+                on_line(f"mihomo config 写入: {'✅' if ok_cfg else '❌'} {msg_cfg[:80]}")
             except Exception as e:
                 on_line(f"[WARN] mihomo config 写入失败: {e}")
 
