@@ -60,19 +60,20 @@ def _build_mihomo_config_from_subscription(subscription_url: str) -> str:
     """v2.0.4: 根据订阅 URL 生成 mihomo config.yaml
     v2.0.5: 默认屏蔽 BT (BitTorrent) 流量 — 节点商查 BT 必封号, 不能用代理流量下 BT
     v2.0.5.1: 端口/服务范围限制 — mihomo 只服务 NAS 自身, 不劫持内网服务
+    v2.0.5.2: 精简规则顺序 — LAN/服务端口前置, GEOIP/MATCH 留兜底, 修代理失效
 
     标准 clash-meta 配置:
     - bind-address: 127.0.0.1 (v2.0.5.1) — mihomo 只监听本机, 不劫持局域网/服务端口
     - proxy-providers 走订阅 URL, health-check 自动测速
     - proxy-groups: URLTest 自动选最快节点 (fallback 用 DIRECT)
-    - rules: 内网 + NAS 服务端口全 DIRECT, BT 屏蔽, 国内直连, 其他走代理
+    - rules: BT 屏蔽 → NAS 服务端口 DIRECT → 国内直连 → 局域网 DIRECT → 其他走代理
     - BT 屏蔽规则 (v2.0.5): 标准 trackers + BT 端口直接 REJECT, 不走代理
 
     用户后续可以在 yacd (9091) 里手动调整规则
     """
     # yaml 里 url 不需要引号, 但保险起见用单引号包住
     safe_url = subscription_url.strip().replace("'", "")
-    return f"""# NASDeployer v2.0.5.1 自动生成 - mihomo 配置
+    return f"""# NASDeployer v2.0.5.2 自动生成 - mihomo 配置
 # 订阅 URL: {safe_url[:60]}{'...' if len(safe_url) > 60 else ''}
 # 控制面板: http://<NAS_IP>:9091/ui (yacd)
 #
@@ -119,14 +120,14 @@ proxy-groups:
     proxies:
       - DIRECT
 
-# 规则 (按优先级匹配):
-# 1) BT 端口 + tracker → REJECT (v2.0.5)
-# 2) NAS 服务端口 → DIRECT (v2.0.5.1, 用户访问 qB/moviepilot/xiaoya 等不被代理劫持)
-# 3) 局域网 → DIRECT (v2.0.5.1, 不劫持其他设备)
+# 规则 (按优先级匹配, v2.0.5.2 优化顺序):
+# 1) BT 端口 + tracker → REJECT (最高优先级)
+# 2) 局域网 + loopback → DIRECT (NAS 自己用, 不出网)
+# 3) NAS 服务端口 → DIRECT (用户访问 qB/moviepilot 等不被代理劫持)
 # 4) 国内 IP → DIRECT
-# 5) 其他 → 代理
+# 5) 其他走代理 (NAS 自己拉镜像 + 解锁 GFW)
 rules:
-  # ===== v2.0.5 BT 屏蔽 (最高优先级) =====
+  # ===== 1) BT 屏蔽 (最高优先级, 防节点商查 BT 封号) =====
   - DST-PORT,6881,REJECT,no-resolve
   - DST-PORT,6882,REJECT,no-resolve
   - DST-PORT,6883,REJECT,no-resolve
@@ -142,7 +143,12 @@ rules:
   - DOMAIN-KEYWORD,bittorrent,REJECT
   - DOMAIN-KEYWORD,torrent,REJECT
   - DOMAIN-KEYWORD,peer,REJECT
-  # ===== v2.0.5.1 NAS 服务端口全 DIRECT (不被代理劫持) =====
+  # ===== 2) 局域网 + loopback (NAS 自己用, v2.0.5.2 提前避免误匹配 AUTO) =====
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  # ===== 3) NAS 服务端口全 DIRECT (不被代理劫持) =====
   # qBittorrent (WebUI)
   - DST-PORT,8080,DIRECT,no-resolve
   # MoviePilot
@@ -197,14 +203,9 @@ rules:
   - DST-PORT,2283,DIRECT,no-resolve
   # mihomo (yacd 控制面板)
   - DST-PORT,9091,DIRECT,no-resolve
-  # ===== v2.0.5.1 局域网全 DIRECT (不劫持其他设备, 即使 bind-address 失效也兜底) =====
-  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
-  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
-  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
-  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
-  # ===== 国内 IP 直连 =====
+  # ===== 4) 国内 IP 直连 =====
   - GEOIP,CN,DIRECT
-  # ===== 其他走代理 (NAS 自己拉镜像 + 解锁 GFW 用) =====
+  # ===== 5) 其他走代理 (NAS 自己拉镜像 + 解锁 GFW 用) =====
   - MATCH,AUTO
 """
 
@@ -321,6 +322,64 @@ class NASConnection:
           (版本查询普通用户能跑, 加上 sudo 反而可能要求 TTY password)
         """
         return self.run_command(cmd, sudo=True, timeout=timeout)
+
+    def _diagnose_proxy(self) -> str:
+        """v2.0.5.2: 诊断代理为什么不工作 — 输出多行诊断文本
+
+        检查项:
+        1. mihomo 容器在跑吗
+        2. mihomo 7890 端口监听了吗
+        3. 直连代理能不能通 (curl -x 测试)
+        4. docker daemon proxy config 配了没
+        5. 直连 docker.io 是不是被墙了
+        """
+        lines = []
+        try:
+            # 1. mihomo 容器状态
+            ec, out = self.run_command("docker ps -a --filter name=mihomo --format '{{.Names}} {{.Status}}'", sudo=True, timeout=10)
+            lines.append(f"1) mihomo 容器: {out.strip()[:100] or '❌ 没找到'}")
+
+            # 2. 7890 端口监听
+            ec, out = self.run_command("ss -tlnp 2>/dev/null | grep 7890 || netstat -tlnp 2>/dev/null | grep 7890", sudo=False, timeout=10)
+            lines.append(f"2) 7890 监听: {out.strip()[:100] or '❌ 未监听 (mihomo 没起来)'}")
+
+            # 3. 代理连通性测试
+            ec, out = self.run_command(
+                "curl -sI -x http://127.0.0.1:7890 --max-time 10 https://www.gstatic.com/generate_204 -o /dev/null -w '%{http_code}' 2>&1 || echo 'curl fail'",
+                sudo=False, timeout=15,
+            )
+            status = out.strip()[-3:] if out.strip() else "fail"
+            lines.append(f"3) 代理测试 (gstatic): HTTP {status} {'✅' if status == '204' else '❌'}")
+
+            # 4. 代理测试 docker.io
+            ec, out = self.run_command(
+                "curl -sI -x http://127.0.0.1:7890 --max-time 10 https://registry-1.docker.io/v2/ -o /dev/null -w '%{http_code}' 2>&1 || echo 'curl fail'",
+                sudo=False, timeout=15,
+            )
+            status = out.strip()[-3:] if out.strip() else "fail"
+            lines.append(f"4) 代理测试 (docker.io): HTTP {status} {'✅' if status in ['200','401','403'] else '❌'}")
+
+            # 5. docker daemon proxy config
+            ec, out = self.run_command("cat ~/.docker/config.json 2>/dev/null | head -20", sudo=False, timeout=5)
+            lines.append(f"5) docker daemon proxy config: {out.strip()[:150] or '❌ 未配置 (docker 不会走代理)'}")
+
+            # 6. 直连 docker.io 测一下 (如果代理挂了, 看是不是网络本身就通)
+            ec, out = self.run_command(
+                "curl -sI --max-time 5 https://registry-1.docker.io/v2/ -o /dev/null -w '%{http_code}' 2>&1 || echo 'unreachable'",
+                sudo=False, timeout=8,
+            )
+            status = out.strip()[-3:] if out.strip() else "fail"
+            lines.append(f"6) 直连 docker.io (无代理): HTTP {status} {'✅ 网络通' if status in ['200','401','403'] else '❌ 直连被墙 (必须走代理)'}")
+
+            # 7. mihomo 容器最近日志
+            ec, out = self.run_command("docker logs mihomo --tail 20 2>&1", sudo=True, timeout=10)
+            lines.append(f"7) mihomo 最近日志:")
+            for log_line in out.strip().splitlines()[-10:]:
+                lines.append(f"   {log_line[:120]}")
+        except Exception as e:
+            lines.append(f"[诊断异常] {type(e).__name__}: {e}")
+
+        return "\n".join(lines)
 
     def run_command(self, command: str, sudo: bool = False, timeout: int = 60) -> Tuple[int, str]:
         """在远程执行命令, 可选 sudo
@@ -709,6 +768,7 @@ class NASConnection:
         1. 上传 docker-compose.yml (快)
         2. docker compose pull (慢, 实时日志, 失败 service 跳过)  ← v1.8 改 per-service
         3. docker compose up -d 已拉到镜像的 service (慢, 实时日志)
+        4. v2.0.5.2: 如果装了 mihomo, 拉完自动跑代理自检 (诊断 docker pull 是否真走代理)
 
         on_line(line: str) - 每行输出
         on_progress(percent: float, stage: str) - 阶段进度 (0-100)
@@ -733,7 +793,7 @@ class NASConnection:
 
         # v2.0.2/v2.0.4: 如果包含 mihomo, 写 mihomo config.yaml
         # v2.0.4: 如果传了 mihomo_subscription_url, 用真订阅配置 (含 proxy-providers + URLTest 组)
-        # 否则写占位 config (容器能起来, 但无代理节点)
+        # v2.0.5.2: 写完后跑代理自检, 诊断 "走了代理还有拉取失败"
         if "mihomo" in selected_apps:
             try:
                 if mihomo_subscription_url:
@@ -819,6 +879,13 @@ rules:
         msg = f"已启动 {len(succeeded_pull)} 个服务"
         if skipped:
             msg += f", 跳过 {len(skipped)} 个 (镜像拉取失败): {', '.join(skipped)}"
+
+        # v2.0.5.2: 装了 mihomo 且有 skipped → 跑代理自检诊断为什么拉不到
+        if skipped and "mihomo" in succeeded_pull:
+            on_line("\n=== 代理自检 (诊断拉取失败) ===")
+            diag = self._diagnose_proxy()
+            for line in diag.splitlines():
+                on_line(line)
 
         # v2.0.2: 如果装了 mihomo, 自动写 ~/.docker/config.json 让后续 docker pull 走代理
         if "mihomo" in succeeded_pull:

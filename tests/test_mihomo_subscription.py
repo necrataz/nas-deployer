@@ -179,6 +179,45 @@ def test_mihomo_bind_localhost():
     print("✅ test_mihomo_bind_localhost — bind-address = 127.0.0.1")
 
 
+def test_mihomo_rule_order_v2_5_2():
+    """v2.0.5.2: 规则顺序 BT → LAN → 服务端口 → GEOIP → MATCH
+    之前 LAN 在服务端口后, 但 LAN 是 NAS 自己用, 应优先匹配避免误匹配 AUTO"""
+    from ssh_client import _build_mihomo_config_from_subscription
+    import re
+    cfg = _build_mihomo_config_from_subscription("https://test.com/sub")
+    rules = re.findall(r"  - (.+)", cfg)
+    # BT 必须最早 (最高优先级)
+    bt_idx = next((i for i, r in enumerate(rules) if "DST-PORT,6881" in r), -1)
+    geoip_idx = next((i for i, r in enumerate(rules) if "GEOIP,CN" in r), -1)
+    lan_idx = next((i for i, r in enumerate(rules) if "IP-CIDR,127.0.0.0/8" in r), -1)
+    qb_idx = next((i for i, r in enumerate(rules) if "DST-PORT,8080" in r), -1)
+    match_idx = next((i for i, r in enumerate(rules) if "MATCH,AUTO" in r), -1)
+    assert bt_idx < lan_idx, f"BT 应在 LAN 前: BT={bt_idx}, LAN={lan_idx}"
+    assert lan_idx < qb_idx, f"LAN 应在 qB 8080 前: LAN={lan_idx}, qB={qb_idx}"
+    assert qb_idx < geoip_idx, f"qB 应在 GEOIP 前: qB={qb_idx}, GEOIP={geoip_idx}"
+    assert geoip_idx < match_idx, f"GEOIP 应在 MATCH 前: GEOIP={geoip_idx}, MATCH={match_idx}"
+    print(f"✅ test_mihomo_rule_order_v2_5_2 — BT({bt_idx}) → LAN({lan_idx}) → 8080({qb_idx}) → GEOIP({geoip_idx}) → MATCH({match_idx})")
+
+
+def test_diagnose_proxy_method_exists():
+    """v2.0.5.2: NASConnection 加 _diagnose_proxy 方法"""
+    from ssh_client import NASConnection
+    assert hasattr(NASConnection, "_diagnose_proxy"), "NASConnection 缺 _diagnose_proxy"
+    print("✅ test_diagnose_proxy_method_exists")
+
+
+def test_diagnose_called_after_skipped():
+    """v2.0.5.2: 当 skipped 非空 + mihomo 装成功 → 自动调诊断
+    不真跑 SSH, 用 grep 源码确认逻辑"""
+    src = os.path.join(os.path.dirname(__file__), "..", "src", "ssh_client.py")
+    with open(src) as f:
+        content = f.read()
+    assert "_diagnose_proxy()" in content, "没调 _diagnose_proxy"
+    # 应该只在 skipped 非空 + mihomo 装成功时触发
+    assert 'if skipped and "mihomo" in succeeded_pull' in content, "触发条件不对"
+    print("✅ test_diagnose_called_after_skipped")
+
+
 if __name__ == "__main__":
     tests = [
         test_build_mihomo_config_basic,
@@ -192,6 +231,9 @@ if __name__ == "__main__":
         test_mihomo_nas_service_ports_direct,
         test_mihomo_lan_direct,
         test_mihomo_bind_localhost,
+        test_mihomo_rule_order_v2_5_2,
+        test_diagnose_proxy_method_exists,
+        test_diagnose_called_after_skipped,
     ]
     passed = 0
     failed = 0
